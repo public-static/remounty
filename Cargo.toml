@@ -1,0 +1,40 @@
+[package]
+name = "remounty"
+version = "0.1.0"
+edition = "2024"
+description = "Menu bar app that re-mounts read-only NTFS volumes read-write using ntfs-3g and macFUSE"
+license = "MIT"
+
+[dependencies]
+tao = "0.37"
+tray-icon = "0.25"
+plist = "1.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+core-foundation-sys = "0.8"
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSDictionary", "NSAttributedString", "NSBundle", "NSError", "NSObject", "NSArray", "NSURL", "NSUUID", "NSUserNotification"] }
+objc2-app-kit = { version = "0.3", features = ["NSMenu", "NSMenuItem", "NSFont", "NSColor", "NSAttributedString", "NSWorkspace"] }
+objc2-user-notifications = { version = "0.3", features = ["UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotification", "UNNotificationTrigger", "block2"] }
+
+[profile.release]
+# Keep unwinding so a bug in a worker thread is caught and reported instead of
+# killing the whole process in the middle of an operation.
+panic = "unwind"
+lto = true
+codegen-units = 1
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+exit = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
