@@ -12,15 +12,22 @@ It works like Mounty and adds two things:
 
 ## Requirements
 
+Install ntfs-3g and macFUSE with [MacPorts](https://www.macports.org):
+
 ```sh
-brew install --cask macfuse
-brew install gromgit/fuse/ntfs-3g-mac
+sudo port install macfuse +fs_link ntfs-3g
 ```
 
-After installing macFUSE, allow its system extension in *System Settings →
-Privacy & Security* and restart if asked. Remounty looks for `ntfs-3g` in
-`/opt/homebrew/bin`, `/usr/local/bin` and `/opt/local/bin`. If yours is
-elsewhere, use *Locate ntfs-3g…* in the menu.
+`+fs_link` creates the `/Library/Filesystems/macfuse.fs` link that macOS
+needs. After installing macFUSE, allow its system extension in *System
+Settings → Privacy & Security* and restart if asked.
+
+Remounty only runs ntfs-3g and macFUSE (as root) when **nobody but root can
+modify them**. MacPorts installs them that way under `/opt/local`. Homebrew
+doesn't: its files belong to your user account, so any program you run could
+replace them. Remounty refuses such installations and explains why. It looks
+for `ntfs-3g` at `/opt/local/bin/ntfs-3g`; use *Locate ntfs-3g…* for another
+root-owned location.
 
 ## Build
 
@@ -50,7 +57,7 @@ The menu bar icon is a drive split into two halves:
 The menu lists every NTFS volume with its state and these actions:
 
 * **Re-mount Read-Write**: replaces macOS's read-only mount with an NTFS-3G
-  mount in `~/.remounty/<name>`. The volume shows up in the Finder sidebar.
+  mount in `/Volumes/<name>`. The volume shows up in the Finder sidebar.
 * **Unmount**: unmounts the NTFS-3G mount and waits until NTFS-3G has written
   everything to disk.
 * **Mount Read-Only / Mount Read-Write** (for unmounted volumes).
@@ -63,18 +70,51 @@ You can turn this off with *Ask When an NTFS Volume Is Attached*. Other items:
 *Start at Login*, *Rescan Volumes*, *Help & Safety Notice…* and *Open Log*
 (`~/Library/Logs/Remounty.log`).
 
-Each mount asks for an administrator password in the standard macOS dialog.
-Remounty never sees or stores the password. Unmounting usually needs no
-password.
+## The privileged helper
 
-**Touch ID.** macOS offers Touch ID in that dialog only to Apple's own apps.
-*Enable Touch ID…* in the menu turns on Touch ID for `sudo` in Apple's
-supported way: it creates `/etc/pam.d/sudo_local` containing one line,
-`auth sufficient pam_tid.so`, and macOS keeps that file across updates. You
-confirm this once with your password. From then on, Remounty authenticates
-through `sudo -k` with Touch ID. If Touch ID fails or you cancel it, you get
-the password dialog instead. Remounty never modifies an existing
-`sudo_local`. To undo the change, delete the file.
+Mounting needs root. The first time you mount read-write, Remounty offers to
+install a small helper, once, with the standard macOS administrator dialog:
+
+| What | Where |
+|------|-------|
+| the helper | `/Library/PrivilegedHelperTools/remounty/` (owned by root) |
+| a sudoers rule that lets you start **only** this helper | `/etc/sudoers.d/remounty` (checked with `visudo`) |
+| two authorization rules | `io.github.remounty.mount`, `io.github.remounty.admin` |
+
+After that, every mount and unmount shows the **macOS authorization dialog**.
+The helper itself asks macOS for your approval, so another program that
+starts the helper directly gets the same dialog and cannot skip it.
+*Helper → Remember Authorization* sets how long macOS remembers your approval
+for Remounty: never, 5 minutes, 1 hour or until logout. macOS keeps that
+approval inside Remounty's own session (`shared = false`), so other programs
+can't reuse it. Remounty never sees or stores your password. Touch ID isn't
+offered, because macOS reserves it in that dialog for Apple's own apps.
+*Helper → Uninstall Helper…* removes everything again.
+
+**Why a helper?**
+
+* **Removable disks.** Commands started through the standard administrator
+  dialog aren't attributed to Remounty, so macOS's Removable Volumes
+  protection stops `ntfs-3g` from opening USB disks ("Operation not
+  permitted"). The helper is started with `sudo` as Remounty's child process,
+  so Remounty's permission applies. On first use macOS asks whether Remounty
+  may access removable volumes; answer **Allow**.
+* **Only root-controlled code runs as root.** Before every mount the helper
+  checks that `ntfs-3g`, every non-system library it loads (followed
+  recursively, including all `@rpath` / `@loader_path` search locations),
+  the folder it loads plugins from, and the macFUSE bundle are root-owned and
+  writable only by root. That includes each file, every folder up to `/`, and
+  the targets of any symlinks. A location that doesn't exist must be one only
+  root could create. If anything fails, the helper refuses and tells you
+  what. Because only root can change files that pass this check, nothing can
+  swap them between the check and their use.
+* **Mount points.** Mount points are created by the helper in `/Volumes`,
+  which only root can modify, so no other program can swap a mount point for
+  a link to a system folder.
+
+**Updates.** When you update ntfs-3g or macFUSE with MacPorts, nothing needs
+to be done: the helper checks the installed files before every mount. After
+Remounty itself is updated, the menu offers *Update Helper…*.
 
 **Volume names.** A volume with a unique label keeps it. Unnamed volumes,
 and volumes that share a label, get their device name added, for example
@@ -104,19 +144,18 @@ to never make things worse:
   `remove_hiberfile` is never used, so a hibernated (Fast Startup) volume
   stays read-only, and the user is told why.
 * **Verifies before acting.** Before every operation, the volume is re-read. It
-  must still be the same volume (matched by UUID, which the root script checks
+  must still be the same volume (matched by UUID, which the helper checks
   again) and in the expected state. Stale menu clicks are harmless.
 * **Verifies after acting.** A mount is confirmed through the kernel mount
   table, including that it really is writable.
 * **Restores after failure.** If a re-mount fails after the read-only mount was
   removed, the read-only mount is put back.
-* **No shell injection.** Root work is a fixed shell script run via
-  `do shell script … with administrator privileges`. Device names, paths,
-  options and volume names are passed as separate arguments and quoted by
-  AppleScript. Volume labels are cleaned before going into `-o volname=` so
-  they cannot inject mount options. Device names must match `diskN[sN…]`.
-* **Only runs a trustworthy `ntfs-3g`.** It must be an executable file named
-  `ntfs-3g` that is not group- or world-writable.
+* **The helper trusts nothing.** Every request needs a macOS authorization.
+  Arguments are validated strictly: device names must match `diskN[sN…]`,
+  and volume labels are cleaned before going into `-o volname=` so they can't
+  inject mount options. `ntfs-3g` runs with an empty environment and no shell
+  is involved. The helper can't be reinstalled through its own sudoers rule.
+* **Only runs protected code as root.** See *The privileged helper* above.
 * **Never deletes data.** Mount-point folders are removed with `rmdir`, which
   only deletes empty folders and never a mount point.
 * **One operation at a time.** Operations run one at a time on a worker thread.
@@ -137,13 +176,18 @@ Windows Fast Startup on disks you share with Windows.
 
 | Module | Role |
 |--------|------|
-| `main.rs` | startup, single instance, `tao` event loop |
+| `lib.rs` | startup, single instance, `tao` event loop (the app's `main.rs` just calls it) |
+| `helper.rs`, `helper_install.rs` | the privileged helper (`remounty-helper`): mount, unmount, cleanup, install, uninstall |
+| `helper_client.rs`, `helper_proto.rs` | app side of the helper; shared paths and exit codes |
+| `trust.rs` | checks that ntfs-3g, its libraries and macFUSE can only be modified by root |
+| `authz.rs` | Authorization Services (session in the app, check in the helper) |
+| `naming.rs` | turning volume labels into safe mount options and folder names |
 | `app.rs` | state and event handling on the main thread (menu, icon, queue, prompts) |
 | `watcher.rs` | DiskArbitration callbacks, debounced scans, mount table polling |
 | `disks.rs` | NTFS discovery via `diskutil … -plist`, mount state classification |
 | `mounts.rs` | kernel mount table via `getfsstat(2)` |
 | `ops.rs` | mount / unmount operations with pre- and post-checks |
-| `privileged.rs` | the root shell scripts and the `osascript` runner |
+| `privileged.rs` | the macOS administrator dialog (used to install the helper) |
 | `worker.rs` | serial operation thread |
 | `ui.rs` | alerts, notifications, file chooser (out of process via `osascript`) |
 | `menu.rs`, `icon.rs` | menu model and procedurally drawn status icon |

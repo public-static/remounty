@@ -11,6 +11,7 @@ APP=target/release/Remounty.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/remounty "$APP/Contents/MacOS/remounty"
+cp target/release/remounty-helper "$APP/Contents/MacOS/remounty-helper"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -35,5 +36,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# Nested code must be signed before the bundle itself.
+codesign --force --sign - "$APP/Contents/MacOS/remounty-helper" >/dev/null 2>&1 || echo "warning: signing the helper failed" >&2
 codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "warning: ad-hoc signing failed" >&2
 echo "Built $APP"

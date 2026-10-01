@@ -1,51 +1,57 @@
 //! Detection of the external tools Remounty relies on: ntfs-3g and macFUSE.
+//!
+//! Both are run as root, so they are only accepted when nobody but root can
+//! modify them (see [`crate::trust`]) — as installed by MacPorts.
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::trust;
 
-pub const NTFS3G_CANDIDATES: &[&str] = &[
-    "/opt/homebrew/bin/ntfs-3g",
-    "/usr/local/bin/ntfs-3g",
-    "/opt/local/bin/ntfs-3g",
-];
+pub const NTFS3G_CANDIDATES: &[&str] = &["/opt/local/bin/ntfs-3g"];
 
-const MACFUSE_BUNDLE: &str = "/Library/Filesystems/macfuse.fs";
-
-pub const INSTALL_HINT: &str = "Install them with Homebrew:\n\n\
-    brew install --cask macfuse\n\
-    brew install gromgit/fuse/ntfs-3g-mac\n\n\
+pub const INSTALL_HINT: &str = "Install them with MacPorts:\n\n\
+    sudo port install macfuse +fs_link ntfs-3g\n\n\
     After installing macFUSE, allow its system extension in System Settings → \
     Privacy & Security and restart your Mac if asked.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dependencies {
     pub ntfs3g: std::result::Result<PathBuf, String>,
-    pub macfuse: bool,
+    pub macfuse: std::result::Result<(), String>,
 }
 
 impl Dependencies {
     pub fn ready(&self) -> bool {
-        self.ntfs3g.is_ok() && self.macfuse
+        self.ntfs3g.is_ok() && self.macfuse.is_ok()
     }
 
-    /// Short description of what is missing, if anything.
+    /// Short description of what is wrong, if anything.
     pub fn problem(&self) -> Option<String> {
-        match (&self.ntfs3g, self.macfuse) {
-            (Ok(_), true) => None,
-            (Err(_), false) => Some("ntfs-3g and macFUSE are not installed".into()),
-            (Err(reason), true) => Some(reason.clone()),
-            (Ok(_), false) => Some("macFUSE is not installed".into()),
+        match (&self.ntfs3g, &self.macfuse) {
+            (Ok(_), Ok(())) => None,
+            (Err(reason), _) => Some(first_line(reason)),
+            (Ok(_), Err(reason)) => Some(first_line(reason)),
         }
     }
+}
+
+fn first_line(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or(text)
+        .trim_end_matches('.')
+        .to_string()
 }
 
 pub fn detect(configured: Option<&Path>) -> Dependencies {
     Dependencies {
         ntfs3g: find_ntfs3g(configured),
-        macfuse: Path::new(MACFUSE_BUNDLE).is_dir(),
+        macfuse: if Path::new(trust::MACFUSE_BUNDLE).exists() {
+            trust::verify_macfuse()
+        } else {
+            Err("macFUSE is not installed".into())
+        },
     }
 }
 
@@ -62,42 +68,13 @@ fn find_ntfs3g(configured: Option<&Path>) -> std::result::Result<PathBuf, String
     Err("ntfs-3g is not installed".into())
 }
 
-/// ntfs-3g runs as root, so only accept a plain executable named `ntfs-3g`
-/// (or `lowntfs-3g`) that cannot be modified by other users.
+/// Accepts only an ntfs-3g that is safe to run as root, together with the
+/// libraries it loads. The helper repeats this check before every mount.
 pub fn validate_ntfs3g(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err(Error::new(format!("{} is not an absolute path", path.display())));
     }
-    let resolved = fs::canonicalize(path)
-        .map_err(|err| Error::new(format!("ntfs-3g at {} is not usable: {err}", path.display())))?;
-    let name_ok = matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some("ntfs-3g" | "lowntfs-3g")
-    );
-    if !name_ok {
-        return Err(Error::new(format!(
-            "{} is not an ntfs-3g executable",
-            path.display()
-        )));
-    }
-    let meta = fs::metadata(&resolved)
-        .map_err(|err| Error::new(format!("Cannot inspect {}: {err}", resolved.display())))?;
-    if !meta.is_file() {
-        return Err(Error::new(format!("{} is not a file", resolved.display())));
-    }
-    let mode = meta.permissions().mode();
-    if mode & 0o111 == 0 {
-        return Err(Error::new(format!("{} is not executable", resolved.display())));
-    }
-    if mode & 0o022 != 0 {
-        return Err(Error::new(format!(
-            "{} is writable by other users; refusing to run it as root",
-            resolved.display()
-        )));
-    }
-    // Hand the original (unresolved) path to callers: Homebrew symlinks keep
-    // working across upgrades, and the target was checked above.
-    Ok(path.to_path_buf())
+    trust::verify_ntfs3g(path).map_err(Error::new)
 }
 
 #[cfg(test)]
@@ -112,31 +89,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_group_writable() {
-        let dir = std::env::temp_dir().join(format!("remounty-deps-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        let exe = dir.join("ntfs-3g");
-        let _ = fs::write(&exe, b"#!/bin/sh\n");
-        let _ = fs::set_permissions(&exe, fs::Permissions::from_mode(0o775));
-        assert!(validate_ntfs3g(&exe).is_err());
-        let _ = fs::set_permissions(&exe, fs::Permissions::from_mode(0o755));
-        assert!(validate_ntfs3g(&exe).is_ok());
-        let _ = fs::set_permissions(&exe, fs::Permissions::from_mode(0o644));
-        assert!(validate_ntfs3g(&exe).is_err());
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn problem_text() {
         let deps = Dependencies {
-            ntfs3g: Err("x".into()),
-            macfuse: false,
+            ntfs3g: Err("x is not owned by root.\n\nmore".into()),
+            macfuse: Err("y".into()),
         };
         assert!(!deps.ready());
-        assert!(deps.problem().is_some());
+        assert_eq!(deps.problem(), Some("x is not owned by root".into()));
         let deps = Dependencies {
-            ntfs3g: Ok("/a/ntfs-3g".into()),
-            macfuse: true,
+            ntfs3g: Ok("/opt/local/bin/ntfs-3g".into()),
+            macfuse: Ok(()),
         };
         assert!(deps.ready());
         assert_eq!(deps.problem(), None);

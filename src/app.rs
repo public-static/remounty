@@ -11,6 +11,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use crate::deps::{self, Dependencies};
 use crate::disks::{self, MountState, Scan, Volume, VolumeKey};
 use crate::error::{Error, Result};
+use crate::helper_client::{self, Status};
 use crate::icon::{self, Activity, IconState};
 use crate::menu::{self, Action, MenuModel, VolumeRow};
 use crate::ops::{self, Operation, Report};
@@ -18,7 +19,7 @@ use crate::settings::{Settings, Store};
 use crate::ui::{self, Answer, Level, UiQueue};
 use crate::watcher::{self, Scanner};
 use crate::worker::Worker;
-use crate::{finder, login, notify, paths, privileged};
+use crate::{finder, login, notify, paths};
 
 pub type Sink = Arc<dyn Fn(AppEvent) + Send + Sync>;
 
@@ -36,7 +37,11 @@ pub enum AppEvent {
     Ntfs3gChosen(Option<PathBuf>),
     /// A notification about this location was clicked.
     OpenPath(PathBuf),
-    TouchIdSetupConfirmed(bool),
+    /// Answer to "install the helper?".
+    HelperInstallAnswered(bool),
+    UninstallConfirmed(bool),
+    /// Result of a background helper cleanup (to avoid retry loops).
+    CleanupFinished,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +63,8 @@ const BTN_QUIT: &str = "Quit Remounty";
 const BTN_REMOUNT: &str = "Re-mount";
 const BTN_ALWAYS: &str = "Always Re-mount";
 const BTN_NOT_NOW: &str = "Not Now";
-const BTN_ENABLE: &str = "Enable Touch ID";
+const BTN_INSTALL: &str = "Install";
+const BTN_REMOVE: &str = "Remove Helper";
 const BTN_CANCEL: &str = "Cancel";
 
 const NOTICE_TITLE: &str = "Important Notice — Please Read Carefully";
@@ -83,7 +89,16 @@ pub struct App {
     store: Store,
     settings: Settings,
     deps: Dependencies,
-    mount_root: Option<PathBuf>,
+    helper: Status,
+    remember_auth_for: Option<u32>,
+    /// Mounts waiting for the helper to be installed or updated.
+    after_install: Vec<Operation>,
+    install_prompt_open: bool,
+    /// A helper cleanup is running in the background.
+    cleanup_running: bool,
+    /// Mount points the last cleanup could not remove (not retried until
+    /// the set changes).
+    cleanup_failed_for: HashSet<PathBuf>,
 
     scan: Scan,
     scan_error: Option<String>,
@@ -115,11 +130,11 @@ impl App {
         let store = Store::new();
         let settings = store.load();
         let deps = deps::detect(settings.ntfs3g_path.as_deref());
-        let mount_root = paths::mount_root();
-        if let Some(root) = &mount_root {
-            ops::clean_stale_mount_points(root);
-        }
+        ops::clean_legacy_mount_root();
         login::refresh();
+        let helper = helper_client::status();
+        let remember = helper_client::current_remember();
+        crate::log_info!("Helper: {helper}");
         log_dependencies(&deps);
         {
             let sink = sink.clone();
@@ -145,7 +160,7 @@ impl App {
         };
         let scanner = {
             let sink = sink.clone();
-            watcher::start(mount_root.clone(), move |result| sink(AppEvent::Scanned(result)))?
+            watcher::start(move |result| sink(AppEvent::Scanned(result)))?
         };
 
         let mut app = Self {
@@ -157,7 +172,12 @@ impl App {
             store,
             settings,
             deps,
-            mount_root,
+            helper,
+            remember_auth_for: remember,
+            after_install: Vec::new(),
+            install_prompt_open: false,
+            cleanup_running: false,
+            cleanup_failed_for: HashSet::new(),
             scan: Scan::default(),
             scan_error: None,
             scanned_once: false,
@@ -220,10 +240,25 @@ impl App {
                 self.open_path(&path);
                 false
             }
-            AppEvent::TouchIdSetupConfirmed(confirmed) => {
-                if confirmed {
-                    self.enqueue(Operation::SetUpTouchId);
+            AppEvent::HelperInstallAnswered(accepted) => {
+                self.install_prompt_open = false;
+                if accepted {
+                    self.enqueue(Operation::InstallHelper);
+                } else if !self.after_install.is_empty() {
+                    crate::log_info!("Helper installation declined; nothing was mounted");
+                    self.after_install.clear();
                 }
+                false
+            }
+            AppEvent::UninstallConfirmed(confirmed) => {
+                if confirmed {
+                    self.enqueue(Operation::UninstallHelper);
+                }
+                false
+            }
+            AppEvent::CleanupFinished => {
+                self.cleanup_running = false;
+                self.scan_after_cleanup();
                 false
             }
         };
@@ -237,7 +272,13 @@ impl App {
     // Scans and newly attached volumes
 
     fn on_scan(&mut self, result: Result<Scan>) {
-        self.deps = deps::detect(self.settings.ntfs3g_path.as_deref());
+        // Verifying the tools inspects every library they load, so only
+        // repeat it while something is missing (e.g. just being installed).
+        // The helper verifies them again before every mount regardless.
+        if !self.deps.ready() {
+            self.deps = deps::detect(self.settings.ntfs3g_path.as_deref());
+        }
+        self.refresh_helper_status();
         let scan = match result {
             Ok(scan) => scan,
             Err(err) => {
@@ -281,16 +322,45 @@ impl App {
         self.known = current;
         self.scan = scan;
         self.scanned_once = true;
-        // Volumes unmounted elsewhere (e.g. ejected in Finder) leave an empty
-        // mount point behind. Only tidy up while no operation is running, so
-        // this can never race with a mount point that is about to be used.
-        if self.running.is_none()
-            && self.queue.is_empty()
-            && let Some(root) = &self.mount_root
-        {
-            ops::clean_stale_mount_points(root);
-        }
+        self.maybe_cleanup();
         self.process_pending();
+    }
+
+    /// Volumes unmounted elsewhere (e.g. ejected in Finder) leave an empty
+    /// mount point in /Volumes behind; the helper removes those. Only while
+    /// idle, and not again for the same leftovers if it failed before.
+    fn maybe_cleanup(&mut self) {
+        if self.cleanup_running
+            || self.running.is_some()
+            || !self.queue.is_empty()
+            || !self.helper.is_ready()
+            || !helper_client::needs_cleanup()
+        {
+            return;
+        }
+        let leftovers: HashSet<PathBuf> = crate::helper_proto::read_created();
+        if leftovers == self.cleanup_failed_for {
+            return;
+        }
+        self.cleanup_running = true;
+        let sink = self.sink.clone();
+        let spawned = std::thread::Builder::new().name("cleanup".into()).spawn(move || {
+            ops::cleanup_mount_points();
+            sink(AppEvent::CleanupFinished);
+        });
+        if let Err(err) = spawned {
+            crate::log_warn!("Could not start cleanup: {err}");
+            self.cleanup_running = false;
+        }
+    }
+
+    fn scan_after_cleanup(&mut self) {
+        if helper_client::needs_cleanup() {
+            // Something could not be removed; do not retry until it changes.
+            self.cleanup_failed_for = crate::helper_proto::read_created();
+        } else {
+            self.cleanup_failed_for.clear();
+        }
     }
 
     fn process_pending(&mut self) {
@@ -316,7 +386,7 @@ impl App {
             if self.settings.is_automount(vol.identity.as_deref()) {
                 if self.deps.ready() {
                     crate::log_info!("Automatically re-mounting {name}");
-                    self.enqueue(Operation::MountReadWrite {
+                    self.request_mount_rw(Operation::MountReadWrite {
                         key,
                         name,
                         label: vol.label.clone(),
@@ -383,10 +453,107 @@ impl App {
             );
             return;
         };
-        self.enqueue(Operation::MountReadWrite {
+        self.request_mount_rw(Operation::MountReadWrite {
             key,
             name: vol.name,
             label: vol.label,
+        });
+    }
+
+    /// Queues a read-write mount, first offering to install or update the
+    /// helper if it is not ready.
+    fn request_mount_rw(&mut self, op: Operation) {
+        self.refresh_helper_status();
+        if self.helper.is_ready() {
+            self.enqueue(op);
+            return;
+        }
+        if !self.after_install.contains(&op) {
+            self.after_install.push(op);
+        }
+        self.ask_install_helper();
+    }
+
+    fn refresh_helper_status(&mut self) {
+        self.helper = helper_client::status();
+    }
+
+    fn ask_install_helper(&mut self) {
+        if self.install_prompt_open || self.running == Some(Operation::InstallHelper) {
+            return;
+        }
+        if self.queue.contains(&Operation::InstallHelper) {
+            return;
+        }
+        self.install_prompt_open = true;
+        let (title, message) = match &self.helper {
+            Status::NotInstalled => (
+                "Install Remounty's helper?".to_string(),
+                "To write to NTFS volumes, Remounty installs a small helper once. You will be \
+                 asked for your administrator password in the standard macOS dialog.\n\n\
+                 What gets installed:\n\
+                 • /Library/PrivilegedHelperTools/remounty — the helper (only root can change it)\n\
+                 • /etc/sudoers.d/remounty — lets Remounty start only this helper\n\
+                 • two authorization rules, so every mount is confirmed in the macOS \
+                 authorization dialog\n\n\
+                 Before every mount the helper checks that ntfs-3g and macFUSE can only be \
+                 changed by root, and refuses otherwise.\n\n\
+                 Your password is never stored. You can remove everything again with “Helper → \
+                 Uninstall Helper…” in the Remounty menu."
+                    .to_string(),
+            ),
+            other => (
+                "Update Remounty's helper?".to_string(),
+                format!(
+                    "Remounty's helper {other}. You will be asked for your administrator \
+                     password in the standard macOS dialog."
+                ),
+            ),
+        };
+        let sink = self.sink.clone();
+        self.ui.submit(move || {
+            let answer = ui::alert(
+                Level::Informational,
+                &title,
+                &message,
+                &[BTN_INSTALL, BTN_CANCEL],
+                ui::DEFAULT_GIVE_UP,
+            );
+            sink(AppEvent::HelperInstallAnswered(
+                answer == Answer::Button(BTN_INSTALL.to_string()),
+            ));
+        });
+    }
+
+    fn confirm_uninstall(&mut self) {
+        if self
+            .scan
+            .volumes
+            .iter()
+            .any(|v| matches!(v.state, MountState::Fuse { ours: true, .. }))
+        {
+            self.ui.show(
+                Level::Informational,
+                "Unmount volumes first",
+                "Some volumes are still mounted with write access through the helper. Unmount \
+                 them before removing the helper.",
+            );
+            return;
+        }
+        let sink = self.sink.clone();
+        self.ui.submit(move || {
+            let answer = ui::alert(
+                Level::Warning,
+                "Remove Remounty's helper?",
+                "Without the helper, Remounty cannot mount volumes with write access until you \
+                 install it again. The helper, the sudoers rule and the authorization rules are removed; ntfs-3g and \
+                 macFUSE stay installed.",
+                &[BTN_REMOVE, BTN_CANCEL],
+                ui::DEFAULT_GIVE_UP,
+            );
+            sink(AppEvent::UninstallConfirmed(
+                answer == Answer::Button(BTN_REMOVE.to_string()),
+            ));
         });
     }
 
@@ -439,12 +606,7 @@ impl App {
         let Some(op) = self.queue.pop_front() else {
             return;
         };
-        match self.worker.submit(
-            op.clone(),
-            self.deps.clone(),
-            self.mount_root.clone(),
-            self.settings.use_touch_id,
-        ) {
+        match self.worker.submit(op.clone(), self.deps.clone()) {
             Ok(()) => self.running = Some(op),
             Err(err) => {
                 crate::log_error!("{err}");
@@ -461,6 +623,23 @@ impl App {
     fn on_op_finished(&mut self, op: Operation, report: Report) {
         if self.running.as_ref() == Some(&op) {
             self.running = None;
+        }
+        if op.affects_helper() {
+            self.refresh_helper_status();
+            self.remember_auth_for = helper_client::current_remember();
+            if op == Operation::InstallHelper {
+                let waiting = std::mem::take(&mut self.after_install);
+                if self.helper.is_ready() {
+                    for next in waiting {
+                        self.enqueue(next);
+                    }
+                } else if !waiting.is_empty() {
+                    crate::log_info!(
+                        "Helper not ready after install; {} mount(s) dropped",
+                        waiting.len()
+                    );
+                }
+            }
         }
         match report {
             Report::Done { message, open_path } => notify::post(paths::APP_NAME, &message, open_path),
@@ -517,11 +696,23 @@ impl App {
                 self.settings.ask_on_attach = !self.settings.ask_on_attach;
                 self.save_settings();
             }
-            Action::ToggleTouchId => {
-                self.settings.use_touch_id = !self.settings.use_touch_id;
-                self.save_settings();
+            Action::InstallHelper => {
+                if self.require_notice() {
+                    self.refresh_helper_status();
+                    if self.helper == Status::Ready {
+                        // Explicit reinstall: no need to explain again.
+                        self.enqueue(Operation::InstallHelper);
+                    } else {
+                        self.ask_install_helper();
+                    }
+                }
             }
-            Action::SetUpTouchId => self.confirm_touch_id_setup(),
+            Action::UninstallHelper => self.confirm_uninstall(),
+            Action::SetRemember(seconds) => {
+                if self.require_notice() && self.remember_auth_for != Some(seconds) {
+                    self.enqueue(Operation::SetRemember { seconds });
+                }
+            }
             Action::ToggleStartAtLogin => {
                 let enable = !login::is_enabled();
                 if let Err(err) = login::set_enabled(enable) {
@@ -533,8 +724,8 @@ impl App {
                 let sink = self.sink.clone();
                 self.ui.submit(move || {
                     let chosen = ui::choose_file(
-                        "Choose the ntfs-3g executable (for example /opt/homebrew/bin/ntfs-3g)",
-                        Path::new("/opt/homebrew/bin"),
+                        "Choose the ntfs-3g executable (for example /opt/local/bin/ntfs-3g)",
+                        Path::new("/opt/local/bin"),
                     );
                     sink(AppEvent::Ntfs3gChosen(chosen));
                 });
@@ -561,7 +752,11 @@ impl App {
         match self.scan.find(key) {
             Some(vol) => {
                 let op = make(key.clone(), vol.name.clone(), vol.label.clone());
-                self.enqueue(op);
+                if matches!(op, Operation::MountReadWrite { .. }) {
+                    self.request_mount_rw(op);
+                } else {
+                    self.enqueue(op);
+                }
             }
             None => {
                 self.ui.show(
@@ -576,33 +771,6 @@ impl App {
 
     fn open_path(&self, path: &Path) {
         finder::open_folder(path, self.ui.clone());
-    }
-
-    fn confirm_touch_id_setup(&mut self) {
-        if privileged::sudo_local_exists() {
-            // Let the operation explain why it cannot proceed.
-            self.enqueue(Operation::SetUpTouchId);
-            return;
-        }
-        let sink = self.sink.clone();
-        self.ui.submit(move || {
-            let answer = ui::alert(
-                Level::Informational,
-                "Use Touch ID instead of typing your password?",
-                "macOS only offers Touch ID in the standard password dialog to Apple's own apps. \
-                 Remounty can use Touch ID through “sudo” instead, which requires enabling Touch \
-                 ID for sudo once. This is Apple's supported way: Remounty creates the file \
-                 /etc/pam.d/sudo_local containing one line (auth sufficient pam_tid.so), and macOS \
-                 keeps it across updates.\n\n\
-                 Note: this also enables Touch ID for “sudo” in Terminal. Your password keeps \
-                 working everywhere. To undo it, delete /etc/pam.d/sudo_local.\n\n\
-                 You will be asked for your password one last time to make this change.",
-                &[BTN_ENABLE, BTN_CANCEL],
-                ui::DEFAULT_GIVE_UP,
-            );
-            let confirmed = answer == Answer::Button(BTN_ENABLE.to_string());
-            sink(AppEvent::TouchIdSetupConfirmed(confirmed));
-        });
     }
 
     fn toggle_automount(&mut self, key: &VolumeKey) {
@@ -699,33 +867,31 @@ impl App {
     }
 
     fn show_help(&self) {
-        let deps_line = match (&self.deps.ntfs3g, self.deps.macfuse) {
-            (Ok(path), true) => format!("✓ ntfs-3g: {}\n✓ macFUSE installed", path.display()),
+        let deps_line = match (&self.deps.ntfs3g, &self.deps.macfuse) {
+            (Ok(path), Ok(())) => format!("✓ ntfs-3g: {}\n✓ macFUSE", path.display()),
             _ => format!(
                 "⚠︎ {}\n\nRemounty needs macFUSE and NTFS-3G. {}",
                 self.deps.problem().unwrap_or_default(),
                 deps::INSTALL_HINT
             ),
         };
-        let root = self
-            .mount_root
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "~/.remounty".into());
         let text = format!(
             "Remounty lists every attached NTFS volume — including those that were attached \
              before it started — and re-mounts them read-write with NTFS-3G.\n\n\
              {deps_line}\n\n\
-             Writable volumes are mounted in {root} and appear in the Finder sidebar. \
-             You will be asked for an administrator password for each mount; Remounty never \
-             stores it.\n\n\
+             Helper: {helper}\n\n\
+             Writable volumes are mounted in /Volumes and appear in the Finder sidebar. Mounting \
+             goes through Remounty's helper, which asks for your administrator password in the \
+             macOS authorization dialog (Helper → Remember Authorization controls how long macOS \
+             remembers it). Remounty never stores your password.\n\n\
              If a volume is refused, it was usually hibernated by Windows (Fast Startup) or \
              not ejected safely. Shut Windows down fully or run “chkdsk /f” there first.\n\n\
              Menu bar icon:\n\
              • left half orange — a volume can be re-mounted\n\
              • left half green — working\n\
              • right half blue — a volume is writable through Remounty\n\n\
-             {NOTICE_TEXT}"
+             {NOTICE_TEXT}",
+            helper = self.helper
         );
         self.ui.show(Level::Informational, HELP_TITLE, text);
     }
@@ -823,8 +989,8 @@ impl App {
             ask_on_attach: self.settings.ask_on_attach,
             start_at_login: login::is_enabled(),
             ntfs3g_missing: self.deps.ntfs3g.is_err(),
-            touch_id_configured: privileged::touch_id_configured(),
-            use_touch_id: self.settings.use_touch_id,
+            helper: self.helper.clone(),
+            remember_auth: self.remember_auth_for,
         };
         match menu::build(&model) {
             Ok(built) => {
@@ -874,5 +1040,8 @@ fn log_dependencies(deps: &Dependencies) {
         Ok(path) => crate::log_info!("ntfs-3g: {}", path.display()),
         Err(reason) => crate::log_warn!("ntfs-3g: {reason}"),
     }
-    crate::log_info!("macFUSE installed: {}", deps.macfuse);
+    match &deps.macfuse {
+        Ok(()) => crate::log_info!("macFUSE: ok"),
+        Err(reason) => crate::log_warn!("macFUSE: {reason}"),
+    }
 }

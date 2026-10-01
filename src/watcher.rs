@@ -8,7 +8,6 @@
 //! If DiskArbitration is unavailable, polling alone keeps the app working.
 
 use std::ffi::c_void;
-use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -137,22 +136,19 @@ impl Scanner {
 
 /// Starts watching; `on_scan` is called (on the scanner thread) with every
 /// scan result, starting with an immediate initial scan of all attached disks.
-pub fn start(
-    mount_root: Option<PathBuf>,
-    on_scan: impl Fn(Result<Scan>) + Send + 'static,
-) -> Result<Scanner> {
+pub fn start(on_scan: impl Fn(Result<Scan>) + Send + 'static) -> Result<Scanner> {
     let (tx, rx) = mpsc::channel();
     start_disk_arbitration(tx.clone());
     thread::Builder::new()
         .name("scanner".into())
-        .spawn(move || scanner_loop(rx, mount_root, on_scan))
+        .spawn(move || scanner_loop(rx, on_scan))
         .map_err(|err| crate::error::Error::new(format!("Could not start scanner thread: {err}")))?;
     let scanner = Scanner { tx };
     scanner.request_scan();
     Ok(scanner)
 }
 
-fn scanner_loop(rx: Receiver<Trigger>, mount_root: Option<PathBuf>, on_scan: impl Fn(Result<Scan>)) {
+fn scanner_loop(rx: Receiver<Trigger>, on_scan: impl Fn(Result<Scan>)) {
     let mut last_fingerprint: Option<u64> = None;
     let mut last_full_scan = Instant::now();
     loop {
@@ -180,10 +176,8 @@ fn scanner_loop(rx: Receiver<Trigger>, mount_root: Option<PathBuf>, on_scan: imp
         }
         last_fingerprint = mounts::snapshot().ok().map(|e| mounts::fingerprint(&e));
         last_full_scan = Instant::now();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            disks::scan(mount_root.as_deref())
-        }))
-        .unwrap_or_else(|_| Err(crate::error::Error::new("Internal error while scanning disks")));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(disks::scan))
+            .unwrap_or_else(|_| Err(crate::error::Error::new("Internal error while scanning disks")));
         on_scan(result);
     }
 }

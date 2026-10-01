@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::cmd;
 use crate::error::{Context, Error, Result};
+use crate::helper_proto;
 use crate::mounts::{self, MountEntry};
 
 pub const DISKUTIL: &str = "/usr/sbin/diskutil";
@@ -46,8 +47,8 @@ pub enum MountState {
         path: PathBuf,
         read_only: bool,
     },
-    /// Mounted through FUSE, i.e. by ntfs-3g. `ours` marks mounts that live in
-    /// Remounty's mount directory.
+    /// Mounted through FUSE, i.e. by ntfs-3g. `ours` marks mount points created
+    /// by Remounty's helper.
     Fuse {
         path: PathBuf,
         read_only: bool,
@@ -276,7 +277,8 @@ pub fn diskutil_info(bsd_name: &str) -> Result<InfoPlist> {
 }
 
 /// Performs a full scan of attached NTFS volumes.
-pub fn scan(mount_root: Option<&Path>) -> Result<Scan> {
+pub fn scan() -> Result<Scan> {
+    let created = helper_proto::read_created();
     let out = cmd::run(Path::new(DISKUTIL), &["list", "-plist"], Some(DISKUTIL_TIMEOUT))?;
     if !out.success() {
         return Err(Error::new(format!("diskutil list failed: {}", out.diagnostics())));
@@ -288,7 +290,7 @@ pub fn scan(mount_root: Option<&Path>) -> Result<Scan> {
     let mut volumes = Vec::new();
     for bsd_name in candidates(&list) {
         match diskutil_info(&bsd_name) {
-            Ok(info) if info.is_ntfs() => volumes.push(volume_from_info(&info, &entries, mount_root)),
+            Ok(info) if info.is_ntfs() => volumes.push(volume_from_info(&info, &entries, &created)),
             Ok(_) => {}
             // A disk that vanishes mid-scan is normal (e.g. it was just ejected).
             Err(err) => crate::log_warn!("Skipping {bsd_name}: {err}"),
@@ -304,12 +306,12 @@ pub fn scan(mount_root: Option<&Path>) -> Result<Scan> {
             .clone();
     }
     assign_unique_names(&mut volumes);
-    let orphans = find_orphans(&volumes, &entries, mount_root);
+    let orphans = find_orphans(&volumes, &entries, &created);
     Ok(Scan { volumes, orphans })
 }
 
 /// Re-reads a single volume. Used right before acting on it.
-pub fn rescan_volume(bsd_name: &str, mount_root: Option<&Path>) -> Result<Volume> {
+pub fn rescan_volume(bsd_name: &str) -> Result<Volume> {
     let info = diskutil_info(bsd_name)?;
     if !info.is_ntfs() {
         return Err(Error::new(format!(
@@ -317,7 +319,7 @@ pub fn rescan_volume(bsd_name: &str, mount_root: Option<&Path>) -> Result<Volume
         )));
     }
     let entries = mounts::snapshot()?;
-    Ok(volume_from_info(&info, &entries, mount_root))
+    Ok(volume_from_info(&info, &entries, &helper_proto::read_created()))
 }
 
 /// `disk6s1` → `disk6`.
@@ -369,7 +371,7 @@ pub fn assign_unique_names(volumes: &mut [Volume]) {
     }
 }
 
-pub fn volume_from_info(info: &InfoPlist, entries: &[MountEntry], mount_root: Option<&Path>) -> Volume {
+pub fn volume_from_info(info: &InfoPlist, entries: &[MountEntry], created: &HashSet<PathBuf>) -> Volume {
     let device_node = format!("/dev/{}", info.device_identifier);
     let mut volume = Volume {
         bsd_name: info.device_identifier.clone(),
@@ -384,7 +386,7 @@ pub fn volume_from_info(info: &InfoPlist, entries: &[MountEntry], mount_root: Op
             info.mount_point.as_deref(),
             info.writable_volume,
             entries,
-            mount_root,
+            created,
         ),
     };
     assign_unique_names(std::slice::from_mut(&mut volume));
@@ -398,19 +400,19 @@ pub fn classify(
     diskutil_mount_point: Option<&str>,
     diskutil_writable: Option<bool>,
     entries: &[MountEntry],
-    mount_root: Option<&Path>,
+    created: &HashSet<PathBuf>,
 ) -> MountState {
     let mut matching: Vec<&MountEntry> = entries.iter().filter(|e| e.from == device_node).collect();
     // A FUSE mount wins if, for whatever reason, both exist.
     matching.sort_by_key(|e| !e.is_fuse());
     if let Some(entry) = matching.first() {
-        return state_for_entry(entry, mount_root);
+        return state_for_entry(entry, created);
     }
     // Some FUSE builds report a different source name; fall back to looking
     // up diskutil's mount point in the mount table.
     if let Some(mp) = diskutil_mount_point.filter(|mp| !mp.is_empty()) {
         if let Some(entry) = entries.iter().find(|e| e.on == Path::new(mp)) {
-            return state_for_entry(entry, mount_root);
+            return state_for_entry(entry, created);
         }
         return MountState::Native {
             path: PathBuf::from(mp),
@@ -420,12 +422,12 @@ pub fn classify(
     MountState::Unmounted
 }
 
-fn state_for_entry(entry: &MountEntry, mount_root: Option<&Path>) -> MountState {
+fn state_for_entry(entry: &MountEntry, created: &HashSet<PathBuf>) -> MountState {
     if entry.is_fuse() {
         MountState::Fuse {
             path: entry.on.clone(),
             read_only: entry.read_only,
-            ours: mount_root.is_some_and(|root| is_inside(&entry.on, root)),
+            ours: created.contains(&entry.on),
         }
     } else {
         MountState::Native {
@@ -435,18 +437,12 @@ fn state_for_entry(entry: &MountEntry, mount_root: Option<&Path>) -> MountState 
     }
 }
 
-pub fn is_inside(path: &Path, root: &Path) -> bool {
-    path.parent().is_some_and(|parent| parent == root)
-}
-
-fn find_orphans(volumes: &[Volume], entries: &[MountEntry], mount_root: Option<&Path>) -> Vec<MountEntry> {
-    let Some(root) = mount_root else {
-        return Vec::new();
-    };
+/// Helper-created ntfs-3g mounts whose disk has disappeared.
+fn find_orphans(volumes: &[Volume], entries: &[MountEntry], created: &HashSet<PathBuf>) -> Vec<MountEntry> {
     let used: HashSet<&Path> = volumes.iter().filter_map(|v| v.state.path()).collect();
     entries
         .iter()
-        .filter(|e| e.is_fuse() && is_inside(&e.on, root) && !used.contains(e.on.as_path()))
+        .filter(|e| e.is_fuse() && created.contains(&e.on) && !used.contains(e.on.as_path()))
         .cloned()
         .collect()
 }
@@ -503,11 +499,25 @@ mod tests {
         }
     }
 
+    fn none() -> HashSet<PathBuf> {
+        HashSet::new()
+    }
+
+    fn set(paths: &[&str]) -> HashSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
     #[test]
     fn classify_native_read_only() {
         let entries = [entry("/dev/disk4s1", "/Volumes/Test", "ntfs", true)];
         assert_eq!(
-            classify("/dev/disk4s1", Some("/Volumes/Test"), Some(false), &entries, None),
+            classify(
+                "/dev/disk4s1",
+                Some("/Volumes/Test"),
+                Some(false),
+                &entries,
+                &none()
+            ),
             MountState::Native {
                 path: "/Volumes/Test".into(),
                 read_only: true
@@ -517,19 +527,19 @@ mod tests {
 
     #[test]
     fn classify_fuse_ours_and_foreign() {
-        let root = Path::new("/Users/u/.remounty");
-        let entries = [entry("/dev/disk4s1", "/Users/u/.remounty/Test", "macfuse", false)];
+        let created = set(&["/Volumes/Test"]);
+        let entries = [entry("/dev/disk4s1", "/Volumes/Test", "macfuse", false)];
         assert_eq!(
-            classify("/dev/disk4s1", None, None, &entries, Some(root)),
+            classify("/dev/disk4s1", None, None, &entries, &created),
             MountState::Fuse {
-                path: "/Users/u/.remounty/Test".into(),
+                path: "/Volumes/Test".into(),
                 read_only: false,
                 ours: true
             }
         );
         let entries = [entry("/dev/disk4s1", "/Users/u/.mounty/Test", "macfuse", false)];
         assert_eq!(
-            classify("/dev/disk4s1", None, None, &entries, Some(root)),
+            classify("/dev/disk4s1", None, None, &entries, &created),
             MountState::Fuse {
                 path: "/Users/u/.mounty/Test".into(),
                 read_only: false,
@@ -545,25 +555,24 @@ mod tests {
             entry("/dev/disk4s1", "/x/Test", "macfuse", false),
         ];
         assert!(matches!(
-            classify("/dev/disk4s1", None, None, &entries, None),
+            classify("/dev/disk4s1", None, None, &entries, &none()),
             MountState::Fuse { .. }
         ));
     }
 
     #[test]
     fn classify_by_mount_point_fallback() {
-        let entries = [entry("ntfs-3g@disk4s1", "/Users/u/.remounty/T", "macfuse", false)];
-        let root = Path::new("/Users/u/.remounty");
+        let entries = [entry("ntfs-3g@disk4s1", "/Volumes/T", "macfuse", false)];
         assert_eq!(
             classify(
                 "/dev/disk4s1",
-                Some("/Users/u/.remounty/T"),
+                Some("/Volumes/T"),
                 None,
                 &entries,
-                Some(root)
+                &set(&["/Volumes/T"])
             ),
             MountState::Fuse {
-                path: "/Users/u/.remounty/T".into(),
+                path: "/Volumes/T".into(),
                 read_only: false,
                 ours: true
             }
@@ -574,23 +583,23 @@ mod tests {
     fn classify_unmounted() {
         let entries = [entry("/dev/disk9s1", "/Volumes/Other", "ntfs", true)];
         assert_eq!(
-            classify("/dev/disk4s1", Some(""), None, &entries, None),
+            classify("/dev/disk4s1", Some(""), None, &entries, &none()),
             MountState::Unmounted
         );
         // "disk4s1" must not match "disk4s10".
         let entries = [entry("/dev/disk4s10", "/Volumes/Other", "ntfs", true)];
         assert_eq!(
-            classify("/dev/disk4s1", None, None, &entries, None),
+            classify("/dev/disk4s1", None, None, &entries, &none()),
             MountState::Unmounted
         );
     }
 
     #[test]
     fn orphans_are_only_ours_and_unclaimed() {
-        let root = Path::new("/r");
+        let created = set(&["/Volumes/A", "/Volumes/B"]);
         let entries = [
-            entry("/dev/disk4s1", "/r/A", "macfuse", false),
-            entry("/dev/disk5s1", "/r/B", "macfuse", false),
+            entry("/dev/disk4s1", "/Volumes/A", "macfuse", false),
+            entry("/dev/disk5s1", "/Volumes/B", "macfuse", false),
             entry("/dev/disk6s1", "/elsewhere/C", "macfuse", false),
         ];
         let volumes = [Volume {
@@ -602,14 +611,17 @@ mod tests {
             size: 0,
             internal: false,
             state: MountState::Fuse {
-                path: "/r/A".into(),
+                path: "/Volumes/A".into(),
                 read_only: false,
                 ours: true,
             },
         }];
-        let orphans = find_orphans(&volumes, &entries, Some(root));
+        let orphans = find_orphans(&volumes, &entries, &created);
         assert_eq!(orphans.len(), 1);
-        assert_eq!(orphans.first().map(|o| o.on.clone()), Some(PathBuf::from("/r/B")));
+        assert_eq!(
+            orphans.first().map(|o| o.on.clone()),
+            Some(PathBuf::from("/Volumes/B"))
+        );
     }
 
     #[test]

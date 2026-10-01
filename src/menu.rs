@@ -12,10 +12,12 @@ use objc2::runtime::AnyObject;
 use objc2::{AnyThread, MainThreadMarker};
 use objc2_app_kit::{NSColor, NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSMenu};
 use objc2_foundation::{NSAttributedString, NSAttributedStringKey, NSDictionary, NSString};
-use tray_icon::menu::{CheckMenuItem, ContextMenu, Menu, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, ContextMenu, Menu, MenuItem, PredefinedMenuItem, Submenu};
 
 use crate::disks::{self, MountState, Volume, VolumeKey};
 use crate::error::{Error, Result};
+use crate::helper_client::Status;
+use crate::helper_proto;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -28,8 +30,9 @@ pub enum Action {
     Rescan,
     ToggleAskOnAttach,
     ToggleStartAtLogin,
-    ToggleTouchId,
-    SetUpTouchId,
+    InstallHelper,
+    UninstallHelper,
+    SetRemember(u32),
     LocateNtfs3g,
     Help,
     ShowNotice,
@@ -56,8 +59,9 @@ impl Action {
             Action::Rescan => "rescan".into(),
             Action::ToggleAskOnAttach => "ask".into(),
             Action::ToggleStartAtLogin => "login".into(),
-            Action::ToggleTouchId => "touchid".into(),
-            Action::SetUpTouchId => "touchid-setup".into(),
+            Action::InstallHelper => "helper-install".into(),
+            Action::UninstallHelper => "helper-uninstall".into(),
+            Action::SetRemember(secs) => format!("remember|{secs}"),
             Action::LocateNtfs3g => "locate".into(),
             Action::Help => "help".into(),
             Action::ShowNotice => "notice".into(),
@@ -69,6 +73,13 @@ impl Action {
     pub fn from_id(id: &str) -> Option<Action> {
         if let Some(path) = id.strip_prefix("stale|") {
             return Some(Action::UnmountStale(PathBuf::from(path)));
+        }
+        if let Some(secs) = id.strip_prefix("remember|") {
+            return secs
+                .parse()
+                .ok()
+                .filter(|s| helper_proto::REMEMBER_CHOICES.contains(s))
+                .map(Action::SetRemember);
         }
         let mut parts = id.splitn(3, '|');
         let tag = parts.next()?;
@@ -93,8 +104,8 @@ impl Action {
             "rescan" => Some(Action::Rescan),
             "ask" => Some(Action::ToggleAskOnAttach),
             "login" => Some(Action::ToggleStartAtLogin),
-            "touchid" => Some(Action::ToggleTouchId),
-            "touchid-setup" => Some(Action::SetUpTouchId),
+            "helper-install" => Some(Action::InstallHelper),
+            "helper-uninstall" => Some(Action::UninstallHelper),
             "locate" => Some(Action::LocateNtfs3g),
             "help" => Some(Action::Help),
             "notice" => Some(Action::ShowNotice),
@@ -122,8 +133,9 @@ pub struct MenuModel {
     pub ask_on_attach: bool,
     pub start_at_login: bool,
     pub ntfs3g_missing: bool,
-    pub touch_id_configured: bool,
-    pub use_touch_id: bool,
+    pub helper: Status,
+    /// Current "remember authorization" duration, if known.
+    pub remember_auth: Option<u32>,
 }
 
 pub struct BuiltMenu {
@@ -176,6 +188,13 @@ pub fn build(model: &MenuModel) -> Result<BuiltMenu> {
             add(&item(&Action::LocateNtfs3g, "Locate ntfs-3g…", true))?;
         }
         add(&item(&Action::Help, "Installation Instructions…", true))?;
+    }
+    match &model.helper {
+        Status::NeedsUpdate(reason) | Status::Broken(reason) if model.deps_ready => {
+            add(&label(&format!("⚠︎ Remounty's helper needs an update ({reason})")))?;
+            add(&item(&Action::InstallHelper, "Update Helper…", !model.busy))?;
+        }
+        _ => {}
     }
     if !model.notice_accepted {
         add(&item(
@@ -290,16 +309,14 @@ pub fn build(model: &MenuModel) -> Result<BuiltMenu> {
         model.start_at_login,
         None,
     ))?;
-    if model.touch_id_configured {
-        add(&CheckMenuItem::with_id(
-            Action::ToggleTouchId.to_id(),
-            "Use Touch ID",
-            true,
-            model.use_touch_id,
-            None,
+    if model.helper == Status::NotInstalled {
+        add(&item(
+            &Action::InstallHelper,
+            "Install Helper…",
+            !model.busy && model.deps_ready,
         ))?;
     } else {
-        add(&item(&Action::SetUpTouchId, "Enable Touch ID…", !model.busy))?;
+        add(&helper_submenu(model)?)?;
     }
     add(&PredefinedMenuItem::separator())?;
     add(&item(&Action::Help, "Help & Safety Notice…", true))?;
@@ -307,6 +324,42 @@ pub fn build(model: &MenuModel) -> Result<BuiltMenu> {
     add(&PredefinedMenuItem::separator())?;
     add(&item(&Action::Quit, "Quit Remounty", true))?;
     Ok(BuiltMenu { menu, headers })
+}
+
+fn helper_submenu(model: &MenuModel) -> Result<Submenu> {
+    let submenu = Submenu::new("Helper", true);
+    let add = |i: &dyn tray_icon::menu::IsMenuItem| {
+        submenu
+            .append(i)
+            .map_err(|err| Error::new(format!("Building menu: {err}")))
+    };
+    add(&label(&format!("Status: {}", model.helper)))?;
+    add(&PredefinedMenuItem::separator())?;
+    add(&label("Remember Authorization"))?;
+    let choices = [
+        (0, "    Never (Always Ask)"),
+        (300, "    5 Minutes"),
+        (3600, "    1 Hour"),
+        (helper_proto::REMEMBER_UNTIL_LOGOUT, "    Until Logout"),
+    ];
+    let ready = model.helper.is_ready() && !model.busy;
+    for (secs, text) in choices {
+        add(&CheckMenuItem::with_id(
+            Action::SetRemember(secs).to_id(),
+            text,
+            ready,
+            model.remember_auth == Some(secs),
+            None,
+        ))?;
+    }
+    add(&PredefinedMenuItem::separator())?;
+    add(&item(
+        &Action::InstallHelper,
+        "Reinstall Helper…",
+        !model.busy && model.deps_ready,
+    ))?;
+    add(&item(&Action::UninstallHelper, "Uninstall Helper…", !model.busy))?;
+    Ok(submenu)
 }
 
 /// "Untitled (disk4s1) — read-only · 65.0 MB · Disk Image"
@@ -383,8 +436,10 @@ mod tests {
             Action::Rescan,
             Action::ToggleAskOnAttach,
             Action::ToggleStartAtLogin,
-            Action::ToggleTouchId,
-            Action::SetUpTouchId,
+            Action::InstallHelper,
+            Action::UninstallHelper,
+            Action::SetRemember(300),
+            Action::SetRemember(helper_proto::REMEMBER_UNTIL_LOGOUT),
             Action::LocateNtfs3g,
             Action::Help,
             Action::ShowNotice,
@@ -403,5 +458,7 @@ mod tests {
         assert_eq!(Action::from_id("format|disk4s1|-"), None);
         assert_eq!(Action::from_id(""), None);
         assert_eq!(Action::from_id("12"), None);
+        assert_eq!(Action::from_id("remember|42"), None);
+        assert_eq!(Action::from_id("remember|abc"), None);
     }
 }

@@ -19,8 +19,6 @@ pub struct Settings {
     pub automount: Vec<AutomountEntry>,
     /// Explicit ntfs-3g location chosen by the user.
     pub ntfs3g_path: Option<PathBuf>,
-    /// Authenticate with Touch ID when it is enabled for sudo.
-    pub use_touch_id: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,7 +35,6 @@ impl Default for Settings {
             ask_on_attach: true,
             automount: Vec::new(),
             ntfs3g_path: None,
-            use_touch_id: true,
         }
     }
 }

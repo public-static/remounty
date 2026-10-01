@@ -1,6 +1,7 @@
-//! The mount operations. Each one re-reads the current state of the volume
-//! right before acting, refuses to do anything unexpected, and after a failure
-//! tries to return the volume to the state it was found in.
+//! The operations. Each one re-reads the current state of the volume right
+//! before acting, refuses to do anything unexpected, and after a failure
+//! tries to return the volume to the state it was found in. Everything that
+//! needs root goes through the privileged helper.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,8 +12,10 @@ use crate::cmd;
 use crate::deps::Dependencies;
 use crate::disks::{self, MountState, Volume, VolumeKey};
 use crate::error::{Error, Result};
-use crate::mounts;
-use crate::privileged::{self, Outcome, exit};
+use crate::helper_client::{self, Status};
+use crate::helper_proto::{self, exit};
+use crate::privileged::Outcome;
+use crate::{mounts, naming, paths};
 
 const USER_DISKUTIL_TIMEOUT: Duration = Duration::from_secs(90);
 const DAEMON_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -37,10 +40,14 @@ pub enum Operation {
         name: String,
         label: String,
     },
-    /// Unmount a leftover ntfs-3g mount in Remounty's directory whose disk is gone.
+    /// Unmount a leftover helper mount whose disk is gone.
     UnmountStale { path: PathBuf },
-    /// Enable Touch ID for sudo (creates /etc/pam.d/sudo_local).
-    SetUpTouchId,
+    /// Install or update the privileged helper.
+    InstallHelper,
+    /// Remove the privileged helper.
+    UninstallHelper,
+    /// Change how long a mount authorization is remembered.
+    SetRemember { seconds: u32 },
 }
 
 impl Operation {
@@ -49,7 +56,7 @@ impl Operation {
             Operation::MountReadWrite { key, .. }
             | Operation::Unmount { key, .. }
             | Operation::MountReadOnly { key, .. } => Some(key),
-            Operation::UnmountStale { .. } | Operation::SetUpTouchId => None,
+            _ => None,
         }
     }
 
@@ -59,8 +66,18 @@ impl Operation {
             Operation::Unmount { name, .. } => format!("Unmounting “{name}”…"),
             Operation::MountReadOnly { name, .. } => format!("Mounting “{name}” read-only…"),
             Operation::UnmountStale { path } => format!("Unmounting {}…", path.display()),
-            Operation::SetUpTouchId => "Setting up Touch ID…".into(),
+            Operation::InstallHelper => "Installing the helper…".into(),
+            Operation::UninstallHelper => "Removing the helper…".into(),
+            Operation::SetRemember { .. } => "Changing the authorization setting…".into(),
         }
+    }
+
+    /// Whether this operation changes the helper itself.
+    pub fn affects_helper(&self) -> bool {
+        matches!(
+            self,
+            Operation::InstallHelper | Operation::UninstallHelper | Operation::SetRemember { .. }
+        )
     }
 }
 
@@ -71,7 +88,7 @@ pub enum Report {
         /// Location to open when the user clicks the notification.
         open_path: Option<PathBuf>,
     },
-    /// The user dismissed the password prompt; nothing was changed.
+    /// The user dismissed the authorization dialog; nothing was changed.
     Canceled,
     Failed {
         title: String,
@@ -86,36 +103,37 @@ impl Report {
             detail: detail.into(),
         }
     }
+
+    fn done(message: impl Into<String>) -> Self {
+        Report::Done {
+            message: message.into(),
+            open_path: None,
+        }
+    }
 }
 
 pub struct Context<'a> {
     pub deps: &'a Dependencies,
-    pub mount_root: Option<&'a Path>,
-    /// Authenticate with Touch ID (via sudo) when it is set up.
-    pub prefer_touch_id: bool,
 }
 
 pub fn execute(op: &Operation, ctx: &Context<'_>) -> Report {
     crate::log_info!("Starting: {op:?}");
     let report = match op {
         Operation::MountReadWrite { key, name, label } => mount_read_write(key, name, label, ctx),
-        Operation::Unmount { key, name, label } => unmount(key, name, label, ctx),
-        Operation::MountReadOnly { key, name, label } => mount_read_only(key, name, label, ctx),
-        Operation::UnmountStale { path } => unmount_stale(path, ctx),
-        Operation::SetUpTouchId => set_up_touch_id(),
+        Operation::Unmount { key, name, label } => unmount(key, name, label),
+        Operation::MountReadOnly { key, name, label } => mount_read_only(key, name, label),
+        Operation::UnmountStale { path } => unmount_stale(path),
+        Operation::InstallHelper => install_helper(),
+        Operation::UninstallHelper => uninstall_helper(),
+        Operation::SetRemember { seconds } => set_remember(*seconds),
     };
     crate::log_info!("Finished: {report:?}");
     report
 }
 
 /// Re-reads the volume and makes sure it is still the one the user picked.
-fn current_volume(
-    key: &VolumeKey,
-    name: &str,
-    label: &str,
-    ctx: &Context<'_>,
-) -> std::result::Result<Volume, Report> {
-    let vol = disks::rescan_volume(&key.bsd_name, ctx.mount_root).map_err(|err| {
+fn current_volume(key: &VolumeKey, name: &str, label: &str) -> std::result::Result<Volume, Report> {
+    let vol = disks::rescan_volume(&key.bsd_name).map_err(|err| {
         Report::failed(
             format!("“{name}” is not available"),
             format!("{err}\n\nWas the disk disconnected?"),
@@ -145,19 +163,26 @@ fn mount_read_write(key: &VolumeKey, name: &str, label: &str, ctx: &Context<'_>)
         Ok(path) => path.clone(),
         Err(reason) => return Report::failed("ntfs-3g is not available", reason.clone()),
     };
-    if !ctx.deps.macfuse {
-        return Report::failed("macFUSE is not installed", crate::deps::INSTALL_HINT);
+    if let Err(reason) = &ctx.deps.macfuse {
+        return Report::failed("macFUSE is not available", reason.clone());
     }
-    let Some(root) = ctx.mount_root else {
-        return Report::failed("Cannot mount", "Your home directory could not be determined.");
-    };
-    let vol = match current_volume(key, name, label, ctx) {
+    let status = helper_client::status();
+    if !status.is_ready() {
+        return Report::failed(
+            "Remounty's helper is not ready",
+            format!(
+                "The helper is {status}. Use “Install Helper…” or “Update Helper…” in the \
+                 Remounty menu, then try again. Nothing was changed."
+            ),
+        );
+    }
+    let vol = match current_volume(key, name, label) {
         Ok(vol) => vol,
         Err(report) => return report,
     };
-    let mode = match &vol.state {
-        MountState::Native { read_only: true, .. } => "remount",
-        MountState::Unmounted => "mount",
+    let remount = match &vol.state {
+        MountState::Native { read_only: true, .. } => true,
+        MountState::Unmounted => false,
         MountState::Native {
             read_only: false,
             path,
@@ -177,59 +202,33 @@ fn mount_read_write(key: &VolumeKey, name: &str, label: &str, ctx: &Context<'_>)
             );
         }
     };
+    let identity = vol.identity.as_deref().filter(|id| naming::is_safe_identity(id));
 
     // The mount point (and the name Finder shows) is the same unique name
     // the menu uses, so two unnamed volumes can be told apart everywhere.
-    let mount_point = match prepare_mount_point(root, name) {
-        Ok(path) => path,
-        Err(err) => return Report::failed(format!("Cannot mount “{name}”"), err.to_string()),
-    };
-    // SAFETY: getuid/getgid have no preconditions and cannot fail.
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    let options = ntfs3g_options(name, uid, gid);
-    let expected = vol
-        .identity
-        .clone()
-        .filter(|id| is_safe_identity(id))
-        .unwrap_or_default();
-    let device = vol.device_node();
-    let mount_point_str = mount_point.to_string_lossy().into_owned();
-    let ntfs3g_str = ntfs3g.to_string_lossy().into_owned();
-    let prompt = format!("Remounty wants to mount “{name}” with write access.");
-
-    let outcome = privileged::run_as_admin(
-        &prompt,
-        privileged::MOUNT_SCRIPT,
-        &[mode, &device, &mount_point_str, &ntfs3g_str, &options, &expected],
-        ctx.prefer_touch_id,
-    );
-
-    let report = match outcome {
-        Ok(Outcome::Success { stdout }) => {
-            if !stdout.trim().is_empty() {
-                crate::log_info!("ntfs-3g output: {}", stdout.trim());
-            }
-            verify_read_write(key, name, &mount_point, ctx)
-        }
+    let report = match helper_client::mount(&vol.bsd_name, identity, remount, name, &ntfs3g) {
+        Ok(Outcome::Success { stdout }) => match helper_client::mounted_path(&stdout) {
+            Some(path) => verify_read_write(key, name, &path),
+            None => Report::failed(
+                format!("Could not verify “{name}”"),
+                format!("The helper reported success without a mount point:\n{stdout}"),
+            ),
+        },
         Ok(Outcome::Canceled) => Report::Canceled,
         Ok(Outcome::Failed { code, message }) => explain_mount_failure(name, code, &message),
         Err(err) => Report::failed(format!("Could not mount “{name}”"), err.to_string()),
     };
-
-    if !matches!(report, Report::Done { .. }) {
-        remove_mount_point(&mount_point, root);
-        if matches!(vol.state, MountState::Native { .. }) {
-            return with_restore_note(report, key, name, ctx);
-        }
+    if remount && !matches!(report, Report::Done { .. }) {
+        return with_restore_note(report, key, name);
     }
     report
 }
 
-fn verify_read_write(key: &VolumeKey, name: &str, mount_point: &Path, ctx: &Context<'_>) -> Report {
+fn verify_read_write(key: &VolumeKey, name: &str, mount_point: &Path) -> Report {
     // The mount table can lag for a moment behind ntfs-3g's exit.
     let mut last = None;
     for _ in 0..20 {
-        match disks::rescan_volume(&key.bsd_name, ctx.mount_root) {
+        match disks::rescan_volume(&key.bsd_name) {
             Ok(vol) => {
                 if let MountState::Fuse { path, read_only, .. } = &vol.state
                     && path == mount_point
@@ -238,10 +237,9 @@ fn verify_read_write(key: &VolumeKey, name: &str, mount_point: &Path, ctx: &Cont
                         Report::failed(
                             format!("“{name}” was mounted read-only"),
                             "ntfs-3g refused write access, most likely because Windows is \
-                                 hibernated or used Fast Startup on this volume. Your data was \
-                                 not modified. Shut Windows down completely (or run \
-                                 “powercfg /h off” in Windows) and try again. The volume stays \
-                                 readable in the meantime.",
+                             hibernated or used Fast Startup on this volume. Your data was not \
+                             modified. Shut Windows down completely (or run “powercfg /h off” \
+                             in Windows) and try again. The volume stays readable in the meantime.",
                         )
                     } else {
                         Report::Done {
@@ -268,20 +266,32 @@ fn verify_read_write(key: &VolumeKey, name: &str, mount_point: &Path, ctx: &Cont
 
 fn explain_mount_failure(name: &str, code: i32, message: &str) -> Report {
     let title = format!("Could not mount “{name}” read-write");
+    // The helper appends whether it put the read-only mount back.
+    let message: String = message
+        .lines()
+        .filter(|l| !l.starts_with("restored-read-only:"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let detail = match code {
         exit::DEVICE_GONE => "The disk is no longer available. Was it disconnected?".to_string(),
-        exit::IDENTITY_MISMATCH => "The device now holds a different volume than the one \
-            selected. Nothing was changed."
-            .to_string(),
+        exit::IDENTITY_MISMATCH => {
+            "The device now holds a different volume than the one selected. Nothing was changed.".to_string()
+        }
         exit::UNMOUNT_FAILED => format!(
             "macOS could not unmount the read-only volume, most likely because a program or \
              Finder window is using it. Close it and try again. Nothing was changed.\n\n{}",
             message.trim()
         ),
         exit::NTFS3G_FAILED => {
-            let reason = privileged::ntfs3g_exit_code(message)
-                .map(ntfs3g_reason)
-                .unwrap_or("ntfs-3g reported an error.");
+            // ntfs-3g maps *every* EPERM to its "hibernated" exit code, including
+            // macOS refusing to let it open the device at all. Tell those apart.
+            let reason = if device_open_denied(&message) {
+                DEVICE_ACCESS_DENIED
+            } else {
+                ntfs3g_exit_code(&message)
+                    .map(ntfs3g_reason)
+                    .unwrap_or("ntfs-3g reported an error.")
+            };
             let output: String = message
                 .lines()
                 .filter(|l| !l.starts_with("ntfs-3g-exit:"))
@@ -289,6 +299,13 @@ fn explain_mount_failure(name: &str, code: i32, message: &str) -> Report {
                 .join("\n");
             format!("{reason}\n\n{}", output.trim())
         }
+        exit::AUTH_FAILED => format!("Authorization failed. Nothing was changed.\n\n{}", message.trim()),
+        exit::UNSAFE_INSTALL => format!(
+            "Remounty's helper refused to run because its installation is not intact. Reinstall \
+             it with “Update Helper…” in the Remounty menu. Nothing was changed.\n\n{}",
+            message.trim()
+        ),
+        exit::WRONG_STATE => format!("{}\n\nNothing was changed.", message.trim()),
         exit::BAD_ARGS | exit::INTERNAL => format!(
             "Remounty refused to continue because of an internal inconsistency. Nothing was \
              changed.\n\n{}",
@@ -299,6 +316,28 @@ fn explain_mount_failure(name: &str, code: i32, message: &str) -> Report {
     Report::failed(title, detail.trim().to_string())
 }
 
+const DEVICE_ACCESS_DENIED: &str = "macOS did not allow ntfs-3g to access the disk, so the volume \
+    was not opened and nothing on it was changed. This is a macOS privacy protection for external \
+    and removable disks, not a problem with the volume.\n\n\
+    Open System Settings → Privacy & Security → Files & Folders and allow “Removable Volumes” for \
+    Remounty, or add Remounty to Full Disk Access, then try again.";
+
+/// ntfs-3g could not even open the device node ("Error opening '/dev/…':
+/// Operation not permitted") — access was denied before anything was read.
+pub fn device_open_denied(message: &str) -> bool {
+    message
+        .lines()
+        .any(|l| l.contains("Error opening '/dev/") && l.contains("Operation not permitted"))
+}
+
+/// Extracts the ntfs-3g exit status the helper reports on failure.
+pub fn ntfs3g_exit_code(message: &str) -> Option<i32> {
+    message
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ntfs-3g-exit:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
 /// Meaning of ntfs-3g's exit codes (`ntfs_volume_status` in ntfs-3g).
 pub fn ntfs3g_reason(code: i32) -> &'static str {
     match code {
@@ -307,13 +346,13 @@ pub fn ntfs3g_reason(code: i32) -> &'static str {
         13 => "The NTFS file system is inconsistent. Repair it on Windows with “chkdsk /f” first.",
         14 => {
             "Windows is hibernated (or used Fast Startup) on this volume. Writing to it now \
-               could destroy data. Shut Windows down completely, or disable Fast Startup with \
-               “powercfg /h off”, then try again."
+             could destroy data. Shut Windows down completely, or disable Fast Startup with \
+             “powercfg /h off”, then try again."
         }
         15 => {
             "The volume was not cleanly unmounted by Windows. To protect your data it will not \
-               be opened for writing. Attach it to Windows, run “chkdsk /f” and eject it safely, \
-               then try again."
+             be opened for writing. Attach it to Windows, run “chkdsk /f” and eject it safely, \
+             then try again."
         }
         16 => "The volume is locked or in use by another program.",
         17 => "The volume is part of a RAID / dynamic disk, which ntfs-3g cannot mount.",
@@ -321,7 +360,7 @@ pub fn ntfs3g_reason(code: i32) -> &'static str {
         20 => "ntfs-3g ran out of memory.",
         21 => {
             "macFUSE could not be used. Make sure its system extension is allowed in System \
-               Settings → Privacy & Security, then restart your Mac."
+             Settings → Privacy & Security, then restart your Mac."
         }
         22 => "ntfs-3g considers this setup insecure and refused to mount.",
         _ => "ntfs-3g could not mount the volume.",
@@ -329,21 +368,30 @@ pub fn ntfs3g_reason(code: i32) -> &'static str {
 }
 
 /// After a failed read-write attempt, make sure a volume that was mounted
-/// read-only before is mounted read-only again.
-fn with_restore_note(report: Report, key: &VolumeKey, name: &str, ctx: &Context<'_>) -> Report {
-    let Ok(vol) = disks::rescan_volume(&key.bsd_name, ctx.mount_root) else {
+/// read-only before is mounted read-only again (the helper already tries;
+/// this is the second line of defence).
+fn with_restore_note(report: Report, key: &VolumeKey, name: &str) -> Report {
+    let Ok(vol) = disks::rescan_volume(&key.bsd_name) else {
         return report;
     };
-    if vol.state != MountState::Unmounted || vol.identity != key.identity {
+    if vol.identity != key.identity {
         return report;
     }
-    crate::log_warn!("{} was left unmounted; mounting it read-only again", key.bsd_name);
-    let note = match diskutil_as_user(&["mount", &vol.bsd_name]) {
-        Ok(()) => format!("“{name}” has been mounted read-only again."),
-        Err(err) => format!(
-            "“{name}” is currently unmounted and could not be mounted read-only again ({err}). \
-             Use “Mount Read-Only” from the menu or reconnect the disk."
-        ),
+    let note = match vol.state {
+        MountState::Unmounted => {
+            crate::log_warn!("{} was left unmounted; mounting it read-only again", key.bsd_name);
+            match diskutil_as_user(&["mount", &vol.bsd_name]) {
+                Ok(()) => format!("“{name}” has been mounted read-only again."),
+                Err(err) => format!(
+                    "“{name}” is currently unmounted and could not be mounted read-only again \
+                     ({err}). Use “Mount Read-Only” from the menu or reconnect the disk."
+                ),
+            }
+        }
+        MountState::Native { read_only: true, .. } if !matches!(report, Report::Canceled) => {
+            format!("“{name}” is mounted read-only, as before.")
+        }
+        _ => return report,
     };
     match report {
         Report::Failed { title, detail } => Report::Failed {
@@ -358,71 +406,56 @@ fn with_restore_note(report: Report, key: &VolumeKey, name: &str, ctx: &Context<
 // ---------------------------------------------------------------------------
 // Unmount
 
-fn unmount(key: &VolumeKey, name: &str, label: &str, ctx: &Context<'_>) -> Report {
-    let vol = match current_volume(key, name, label, ctx) {
+fn unmount(key: &VolumeKey, name: &str, label: &str) -> Report {
+    let vol = match current_volume(key, name, label) {
         Ok(vol) => vol,
         Err(report) => return report,
     };
-    let MountState::Fuse { path, .. } = &vol.state else {
+    let MountState::Fuse { path, ours, .. } = &vol.state else {
         return Report::failed(
             format!("“{name}” is not mounted with ntfs-3g"),
             "Nothing was changed.",
         );
     };
-    let prompt = format!("Remounty wants to unmount “{name}”.");
-    let report = unmount_path(path, &vol.device_node(), &prompt, name, ctx.prefer_touch_id);
-    if matches!(report, Report::Done { .. })
-        && let Some(root) = ctx.mount_root
-    {
-        remove_mount_point(path, root);
-    }
-    report
+    unmount_path(path, &vol.device_node(), name, *ours)
 }
 
-fn unmount_stale(path: &Path, ctx: &Context<'_>) -> Report {
-    let Some(root) = ctx.mount_root else {
-        return Report::failed("Cannot unmount", "Your home directory could not be determined.");
-    };
-    let is_stale_fuse = mounts::snapshot()
+fn unmount_stale(path: &Path) -> Report {
+    let is_ours = helper_proto::read_created().contains(path);
+    let is_fuse = mounts::snapshot()
         .map(|entries| entries.iter().any(|e| e.on == path && e.is_fuse()))
         .unwrap_or(false);
-    if !disks::is_inside(path, root) || !is_stale_fuse {
+    if !is_ours || !is_fuse {
         return Report::failed(
             "Nothing to unmount",
-            format!("{} is not an ntfs-3g mount.", path.display()),
+            format!("{} is not an ntfs-3g mount created by Remounty.", path.display()),
         );
     }
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let prompt = format!("Remounty wants to unmount “{name}”.");
-    let report = unmount_path(path, "", &prompt, &name, ctx.prefer_touch_id);
-    if matches!(report, Report::Done { .. }) {
-        remove_mount_point(path, root);
-    }
-    report
+    unmount_path(path, "", &name, true)
 }
 
 /// Unmounts without ever forcing it: a busy volume is reported, not yanked.
-fn unmount_path(path: &Path, device: &str, prompt: &str, name: &str, prefer_touch_id: bool) -> Report {
+/// Tries without privileges first; the helper is only needed if that fails.
+fn unmount_path(path: &Path, device: &str, name: &str, ours: bool) -> Report {
     let path_str = path.to_string_lossy().into_owned();
     let first_attempt = diskutil_as_user(&["unmount", &path_str]);
     // A timed-out attempt may still have completed; never escalate for a
     // volume that is already gone.
-    let still_mounted_after_attempt = || {
-        mounts::snapshot()
-            .map(|entries| entries.iter().any(|e| e.on == path))
-            .unwrap_or(true)
-    };
     if let Err(err) = &first_attempt
-        && still_mounted_after_attempt()
+        && is_mounted(path)
     {
-        crate::log_info!("Unprivileged unmount failed ({err}); asking for administrator rights");
         if is_busy_message(err.message()) {
             return busy_report(name, err.message());
         }
-        match privileged::run_as_admin(prompt, privileged::UNMOUNT_SCRIPT, &[&path_str], prefer_touch_id) {
+        if !ours {
+            return Report::failed(format!("Could not unmount “{name}”"), err.to_string());
+        }
+        crate::log_info!("Unprivileged unmount failed ({err}); asking the helper");
+        match helper_client::unmount(path) {
             Ok(Outcome::Success { .. }) => {}
             Ok(Outcome::Canceled) => return Report::Canceled,
             Ok(Outcome::Failed { message, .. }) => {
@@ -434,10 +467,7 @@ fn unmount_path(path: &Path, device: &str, prompt: &str, name: &str, prefer_touc
             Err(err) => return Report::failed(format!("Could not unmount “{name}”"), err.to_string()),
         }
     }
-    let still_mounted = mounts::snapshot()
-        .map(|entries| entries.iter().any(|e| e.on == path))
-        .unwrap_or(true);
-    if still_mounted {
+    if is_mounted(path) {
         return Report::failed(
             format!("“{name}” is still mounted"),
             "The unmount command reported success, but the volume is still mounted.",
@@ -450,46 +480,28 @@ fn unmount_path(path: &Path, device: &str, prompt: &str, name: &str, prefer_touc
              little before disconnecting the disk.",
         );
     }
-    Report::Done {
-        message: format!("“{name}” was unmounted and all changes were written to the disk."),
-        open_path: None,
+    if ours {
+        cleanup_mount_points();
+    }
+    Report::done(format!(
+        "“{name}” was unmounted and all changes were written to the disk."
+    ))
+}
+
+/// Asks the helper to remove mount points in /Volumes that are no longer in
+/// use. Harmless if it fails (the folders are empty and root-owned).
+pub fn cleanup_mount_points() {
+    match helper_client::cleanup() {
+        Ok(Outcome::Success { .. }) => {}
+        Ok(other) => crate::log_warn!("Helper cleanup: {other:?}"),
+        Err(err) => crate::log_warn!("Helper cleanup: {err}"),
     }
 }
 
-fn set_up_touch_id() -> Report {
-    if privileged::touch_id_configured() {
-        return Report::Done {
-            message: "Touch ID is already enabled.".into(),
-            open_path: None,
-        };
-    }
-    if privileged::sudo_local_exists() {
-        return Report::failed(
-            "Touch ID cannot be enabled automatically",
-            format!(
-                "{} already exists, and Remounty does not modify existing security settings. \
-                 To use Touch ID, add this line to that file yourself:\n\n\
-                 auth       sufficient     pam_tid.so",
-                privileged::PAM_SUDO_LOCAL
-            ),
-        );
-    }
-    let prompt = "Remounty wants to enable Touch ID for administrator requests.";
-    match privileged::run_as_admin(prompt, privileged::SETUP_TOUCH_ID_SCRIPT, &[], false) {
-        Ok(Outcome::Success { .. }) if privileged::touch_id_configured() => Report::Done {
-            message: "Touch ID is now enabled for Remounty.".into(),
-            open_path: None,
-        },
-        Ok(Outcome::Success { .. }) => Report::failed(
-            "Touch ID could not be enabled",
-            "The setup finished, but Touch ID is still not configured.",
-        ),
-        Ok(Outcome::Canceled) => Report::Canceled,
-        Ok(Outcome::Failed { message, .. }) => {
-            Report::failed("Touch ID could not be enabled", message.trim().to_string())
-        }
-        Err(err) => Report::failed("Touch ID could not be enabled", err.to_string()),
-    }
+fn is_mounted(path: &Path) -> bool {
+    mounts::snapshot()
+        .map(|entries| entries.iter().any(|e| e.on == path))
+        .unwrap_or(true)
 }
 
 fn busy_report(name: &str, detail: &str) -> Report {
@@ -554,8 +566,8 @@ pub fn ps_lists_ntfs3g(ps_output: &str, device: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Mount read-only (native driver)
 
-fn mount_read_only(key: &VolumeKey, name: &str, label: &str, ctx: &Context<'_>) -> Report {
-    let vol = match current_volume(key, name, label, ctx) {
+fn mount_read_only(key: &VolumeKey, name: &str, label: &str) -> Report {
+    let vol = match current_volume(key, name, label) {
         Ok(vol) => vol,
         Err(report) => return report,
     };
@@ -565,11 +577,70 @@ fn mount_read_only(key: &VolumeKey, name: &str, label: &str, ctx: &Context<'_>) 
     match diskutil_as_user(&["mount", &vol.bsd_name]) {
         Ok(()) => Report::Done {
             message: format!("“{name}” was mounted read-only."),
-            open_path: disks::rescan_volume(&vol.bsd_name, ctx.mount_root)
+            open_path: disks::rescan_volume(&vol.bsd_name)
                 .ok()
                 .and_then(|v| v.state.path().map(Path::to_path_buf)),
         },
         Err(err) => Report::failed(format!("Could not mount “{name}”"), err.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper management
+
+fn install_helper() -> Report {
+    let title = "The helper could not be installed";
+    let Some(user) = paths::user_name() else {
+        return Report::failed(title, "Your user name could not be determined.");
+    };
+    // Keep the user's "remember" choice across updates.
+    let remember = helper_client::current_remember()
+        .filter(|s| helper_proto::REMEMBER_CHOICES.contains(s))
+        .unwrap_or(0);
+    match helper_client::install(&user, remember) {
+        Ok(Outcome::Success { .. }) => match helper_client::status() {
+            Status::Ready => Report::done("Remounty's helper is installed."),
+            other => Report::failed(title, format!("After installing, the helper is {other}.")),
+        },
+        Ok(Outcome::Canceled) => Report::Canceled,
+        Ok(Outcome::Failed { message, .. }) => Report::failed(title, message.trim().to_string()),
+        Err(err) => Report::failed(title, err.to_string()),
+    }
+}
+
+fn uninstall_helper() -> Report {
+    let title = "The helper could not be removed";
+    // A working helper removes itself (asking for authorization); a damaged
+    // one is removed through the administrator dialog.
+    let outcome = match helper_client::uninstall() {
+        Ok(Outcome::Failed {
+            code: exit::UNSAFE_INSTALL,
+            ..
+        }) => helper_client::uninstall_with_dialog(),
+        other => other,
+    };
+    match outcome {
+        Ok(Outcome::Success { .. }) => Report::done("Remounty's helper was removed."),
+        Ok(Outcome::Canceled) => Report::Canceled,
+        Ok(Outcome::Failed { message, .. }) => Report::failed(title, message.trim().to_string()),
+        Err(err) => Report::failed(title, err.to_string()),
+    }
+}
+
+fn set_remember(seconds: u32) -> Report {
+    match helper_client::set_remember(seconds) {
+        Ok(Outcome::Success { .. }) => Report::done(match seconds {
+            0 => "Remounty will ask for authorization every time.".to_string(),
+            helper_proto::REMEMBER_UNTIL_LOGOUT => {
+                "Your authorization is remembered until you log out.".to_string()
+            }
+            s => format!("Your authorization is remembered for {} minutes.", s / 60),
+        }),
+        Ok(Outcome::Canceled) => Report::Canceled,
+        Ok(Outcome::Failed { message, .. }) => {
+            Report::failed("The setting could not be changed", message.trim().to_string())
+        }
+        Err(err) => Report::failed("The setting could not be changed", err.to_string()),
     }
 }
 
@@ -585,132 +656,14 @@ fn diskutil_as_user(args: &[&str]) -> Result<()> {
     }
 }
 
-/// Options passed to ntfs-3g. Mirrors Mounty's proven set, plus `norecover`
-/// so a volume with an unclean journal is refused instead of having its
-/// Windows log file wiped.
-pub fn ntfs3g_options(volume_name: &str, uid: u32, gid: u32) -> String {
-    format!(
-        "volname={},local,negative_vncache,auto_xattr,auto_cache,noatime,windows_names,\
-         streams_interface=openxattr,inherit,allow_other,big_writes,norecover,uid={uid},gid={gid}",
-        sanitize_volname(volume_name)
-    )
-}
-
-/// FUSE parses `-o` as a comma separated list with backslash escapes, so the
-/// label must not contain either (otherwise it could inject options).
-pub fn sanitize_volname(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c == ',' || c == '\\' || c.is_control() {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let truncated: String = cleaned.chars().take(63).collect();
-    if truncated.is_empty() {
-        "Untitled".to_string()
-    } else {
-        truncated
-    }
-}
-
-/// Turns a volume label into a safe single path component.
-pub fn sanitize_dir_name(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c == '/' || c == ':' || c.is_control() {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim().trim_start_matches('.').trim();
-    let truncated: String = trimmed.chars().take(64).collect();
-    let truncated = truncated.trim().to_string();
-    if truncated.is_empty() {
-        "Untitled".to_string()
-    } else {
-        truncated
-    }
-}
-
-fn is_safe_identity(id: &str) -> bool {
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
-}
-
-/// Creates (as the current user) an empty directory to mount on. Existing
-/// directories are only reused if they are empty and not mounted on.
-pub fn prepare_mount_point(root: &Path, volume_name: &str) -> Result<PathBuf> {
-    ensure_root(root)?;
-    let mounted: Vec<PathBuf> = mounts::snapshot()?.into_iter().map(|e| e.on).collect();
-    let base = sanitize_dir_name(volume_name);
-    for n in 1..=99 {
-        let candidate = if n == 1 {
-            base.clone()
-        } else {
-            format!("{base} {n}")
-        };
-        let path = root.join(&candidate);
-        match fs::symlink_metadata(&path) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&path)
-                    .map_err(|err| Error::new(format!("Cannot create {}: {err}", path.display())))?;
-                return Ok(path);
-            }
-            Err(err) => return Err(Error::new(format!("Cannot inspect {}: {err}", path.display()))),
-            Ok(meta) => {
-                let reusable = meta.is_dir()
-                    && !mounted.contains(&path)
-                    && fs::read_dir(&path)
-                        .map(|mut d| d.next().is_none())
-                        .unwrap_or(false);
-                if reusable {
-                    return Ok(path);
-                }
-            }
-        }
-    }
-    Err(Error::new(format!(
-        "No free mount point name for “{volume_name}” in {}",
-        root.display()
-    )))
-}
-
-fn ensure_root(root: &Path) -> Result<()> {
-    match fs::symlink_metadata(root) {
-        Ok(meta) if meta.is_dir() => Ok(()),
-        Ok(_) => Err(Error::new(format!(
-            "{} exists but is not a directory; please move it away",
-            root.display()
-        ))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(root).map_err(|err| Error::new(format!("Cannot create {}: {err}", root.display())))
-        }
-        Err(err) => Err(Error::new(format!("Cannot inspect {}: {err}", root.display()))),
-    }
-}
-
-/// Removes a mount point directory Remounty created. `remove_dir` only ever
-/// deletes *empty* directories and fails on mount points, so this can never
-/// remove user data.
-pub fn remove_mount_point(path: &Path, root: &Path) {
-    if !disks::is_inside(path, root) {
+/// Removes empty, unused folders left in `~/.remounty` by earlier versions,
+/// which mounted there. `remove_dir` only deletes empty directories and
+/// fails on mount points, so this cannot remove data.
+pub fn clean_legacy_mount_root() {
+    let Some(root) = paths::legacy_mount_root() else {
         return;
-    }
-    if let Err(err) = fs::remove_dir(path) {
-        crate::log_warn!("Leaving {} in place: {err}", path.display());
-    }
-}
-
-/// Removes empty, unused mount point directories left behind by earlier runs.
-pub fn clean_stale_mount_points(root: &Path) {
-    let Ok(entries) = fs::read_dir(root) else {
+    };
+    let Ok(entries) = fs::read_dir(&root) else {
         return;
     };
     let mounted: Vec<PathBuf> = mounts::snapshot()
@@ -722,46 +675,15 @@ pub fn clean_stale_mount_points(root: &Path) {
         let path = entry.path();
         let is_real_dir = fs::symlink_metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
         if is_real_dir && !mounted.contains(&path) {
-            // Fails harmlessly unless the directory is empty.
             let _ = fs::remove_dir(&path);
         }
     }
+    let _ = fs::remove_dir(&root);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn volname_cannot_inject_options() {
-        assert_eq!(sanitize_volname("Test Vol, x"), "Test Vol x");
-        assert_eq!(sanitize_volname("a,allow_root,uid=0"), "a allow_root uid=0");
-        assert_eq!(sanitize_volname("back\\slash"), "back slash");
-        assert_eq!(sanitize_volname(" \n "), "Untitled");
-        let opts = ntfs3g_options("x,ro,remove_hiberfile", 501, 20);
-        assert!(!opts.contains(",ro,"));
-        assert!(!opts.contains(",remove_hiberfile"));
-        assert!(opts.contains("norecover"));
-        assert!(opts.ends_with("uid=501,gid=20"));
-    }
-
-    #[test]
-    fn dir_names_are_single_components() {
-        assert_eq!(sanitize_dir_name("../../etc"), "_.._etc");
-        assert_eq!(sanitize_dir_name("a/b:c"), "a_b_c");
-        assert_eq!(sanitize_dir_name(".hidden"), "hidden");
-        assert_eq!(sanitize_dir_name(""), "Untitled");
-        assert_eq!(sanitize_dir_name("..."), "Untitled");
-        assert_eq!(sanitize_dir_name("Test Vol, x"), "Test Vol, x");
-        assert!(sanitize_dir_name(&"x".repeat(500)).chars().count() <= 64);
-    }
-
-    #[test]
-    fn safe_identity() {
-        assert!(is_safe_identity("1163E33B-7486-4255-A385-3F1F6BDE1CD6"));
-        assert!(!is_safe_identity(""));
-        assert!(!is_safe_identity("abc; rm"));
-    }
 
     #[test]
     fn busy_detection() {
@@ -774,7 +696,7 @@ mod tests {
 
     #[test]
     fn ps_matching() {
-        let ps = "/opt/homebrew/bin/ntfs-3g /dev/disk4s1 /Users/u/.remounty/T -o volname=T\n\
+        let ps = "/Library/PrivilegedHelperTools/remounty/bin/ntfs-3g /dev/disk4s1 /Volumes/T -o volname=T\n\
                   /usr/bin/vim /dev/disk4s1\n";
         assert!(ps_lists_ntfs3g(ps, "/dev/disk4s1"));
         assert!(!ps_lists_ntfs3g(ps, "/dev/disk4s10"));
@@ -782,39 +704,45 @@ mod tests {
     }
 
     #[test]
-    fn mount_point_preparation() {
-        let root = std::env::temp_dir().join(format!("remounty-mp-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let first = prepare_mount_point(&root, "Data").ok();
-        assert_eq!(first, Some(root.join("Data")));
-        // Empty, unmounted directory is reused.
-        assert_eq!(prepare_mount_point(&root, "Data").ok(), Some(root.join("Data")));
-        // A non-empty directory is never mounted over.
-        let _ = fs::write(root.join("Data").join("file"), b"keep me");
-        assert_eq!(prepare_mount_point(&root, "Data").ok(), Some(root.join("Data 2")));
-        // Cleanup keeps non-empty directories.
-        remove_mount_point(&root.join("Data"), &root);
-        assert!(root.join("Data").join("file").exists());
-        clean_stale_mount_points(&root);
-        assert!(!root.join("Data 2").exists());
-        assert!(root.join("Data").exists());
-        // Paths outside the root are never touched.
-        let outside = std::env::temp_dir().join(format!("remounty-out-{}", std::process::id()));
-        let _ = fs::create_dir_all(&outside);
-        remove_mount_point(&outside, &root);
-        assert!(outside.exists());
-        let _ = fs::remove_dir_all(&outside);
-        let _ = fs::remove_dir_all(&root);
+    fn extracts_ntfs3g_code() {
+        assert_eq!(
+            ntfs3g_exit_code("ntfs-3g-exit: 15\nThe disk contains an unclean file system"),
+            Some(15)
+        );
+        assert_eq!(ntfs3g_exit_code("nothing"), None);
+    }
+
+    #[test]
+    fn device_permission_is_not_reported_as_hibernation() {
+        let message = "ntfs-3g-exit: 14\nError opening '/dev/disk4s2': Operation not permitted\n\
+                       Failed to mount '/dev/disk4s2': Operation not permitted\n\
+                       The NTFS partition is in an unsafe state. Please resume and shutdown";
+        let report = explain_mount_failure("X", exit::NTFS3G_FAILED, message);
+        assert!(matches!(report, Report::Failed { .. }));
+        if let Report::Failed { detail, .. } = report {
+            assert!(detail.contains("Removable Volumes"));
+            assert!(!detail.starts_with("Windows is hibernated"));
+        }
+        // A genuine hibernation report keeps its explanation.
+        let hibernated = "ntfs-3g-exit: 14\nWindows is hibernated, refused to mount.";
+        if let Report::Failed { detail, .. } = explain_mount_failure("X", exit::NTFS3G_FAILED, hibernated) {
+            assert!(detail.starts_with("Windows is hibernated"));
+        }
     }
 
     #[test]
     fn failure_explanations() {
-        let report = explain_mount_failure("X", exit::NTFS3G_FAILED, "ntfs-3g-exit: 15\nunclean");
+        let report = explain_mount_failure(
+            "X",
+            exit::NTFS3G_FAILED,
+            "ntfs-3g-exit: 15\nunclean\nrestored-read-only: yes",
+        );
         assert!(matches!(report, Report::Failed { .. }));
         if let Report::Failed { detail, .. } = report {
             assert!(detail.contains("not cleanly unmounted"));
             assert!(detail.contains("unclean"));
             assert!(!detail.contains("ntfs-3g-exit"));
+            assert!(!detail.contains("restored-read-only"));
         }
     }
 }
