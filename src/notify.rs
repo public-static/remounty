@@ -127,7 +127,8 @@ fn path_from_response(response: &UNNotificationResponse) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-fn running_in_app_bundle() -> bool {
+/// Whether this process runs as an application bundle (`….app`).
+pub fn running_in_app_bundle() -> bool {
     let bundle = NSBundle::mainBundle();
     bundle.bundleIdentifier().is_some() && bundle.bundlePath().to_string().ends_with(".app")
 }

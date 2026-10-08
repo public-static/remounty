@@ -192,6 +192,21 @@ impl App {
             scan_error_reported: false,
             menu_error_reported: false,
         };
+        if !notify::running_in_app_bundle() {
+            crate::log_warn!("Not running as Remounty.app; privacy permissions belong to the launching app");
+            app.ui.show(
+                Level::Warning,
+                "Remounty is not running as Remounty.app",
+                "Remounty was started directly from its executable (for example from Terminal or \
+                 an editor), not as Remounty.app.\n\n\
+                 macOS then applies the privacy permissions of the app that started it. Mounting \
+                 USB and other removable disks will most likely fail with “Operation not \
+                 permitted”, because that app — not Remounty — needs “Removable Volumes” access. \
+                 Notifications and the Finder integration may not work either.\n\n\
+                 Quit Remounty and open Remounty.app instead (from Finder or with “open \
+                 Remounty.app”).",
+            );
+        }
         if !app.settings.disclaimer_accepted {
             app.show_notice();
         }
