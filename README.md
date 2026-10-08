@@ -86,7 +86,7 @@ install a small helper, once, with the standard macOS administrator dialog:
 |------|-------|
 | the helper | `/Library/PrivilegedHelperTools/remounty/` (owned by root) |
 | a sudoers rule that lets you start **only** this helper | `/etc/sudoers.d/remounty` (checked with `visudo`) |
-| two authorization rules | `io.github.remounty.mount`, `io.github.remounty.admin` |
+| two authorization rules | `app.remounty.mount`, `app.remounty.admin` |
 
 After that, every mount and unmount shows the **macOS authorization dialog**.
 The helper itself asks macOS for your approval, so another program that

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever the helper's behaviour or protocol changes; the app
 /// offers to update an installed helper with a different version.
-pub const HELPER_VERSION: &str = "1";
+pub const HELPER_VERSION: &str = "2";
 
 pub const HELPER_DIR: &str = "/Library/PrivilegedHelperTools/remounty";
 pub const HELPER_BIN: &str = "/Library/PrivilegedHelperTools/remounty/remounty-helper";
@@ -30,9 +30,11 @@ pub const BUNDLED_HELPER_NAME: &str = "remounty-helper";
 pub const VOLUMES_DIR: &str = "/Volumes";
 
 /// Right checked for every mount / unmount.
-pub const MOUNT_RIGHT: &str = "io.github.remounty.mount";
+pub const MOUNT_RIGHT: &str = "app.remounty.mount";
 /// Right checked for changing settings and uninstalling (always asks).
-pub const ADMIN_RIGHT: &str = "io.github.remounty.admin";
+pub const ADMIN_RIGHT: &str = "app.remounty.admin";
+/// Rights installed by helper version 1 (removed on install / uninstall).
+pub const LEGACY_RIGHTS: [&str; 2] = ["io.github.remounty.mount", "io.github.remounty.admin"];
 
 /// Allowed values for "remember authentication", in seconds.
 pub const REMEMBER_CHOICES: [u32; 4] = [0, 300, 3600, REMEMBER_UNTIL_LOGOUT];

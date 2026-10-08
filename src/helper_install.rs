@@ -71,6 +71,9 @@ pub fn install(args: &[String]) -> HelperResult {
         .and_then(|()| write_right(helper_proto::ADMIN_RIGHT, "Change Remounty's helper settings.", 0))
         .and_then(|()| install_sudoers(user))
         .inspect_err(|_| rollback())?;
+    for right in helper_proto::LEGACY_RIGHTS {
+        let _ = run_tool("/usr/bin/security", &["authorizationdb", "remove", right], None);
+    }
     let _ = remove_tree(Path::new(OLD_DIR));
     println!("INSTALLED");
     Ok(())
@@ -96,7 +99,8 @@ pub fn uninstall(args: &[String]) -> HelperResult {
     }
     // Revoke access first, then remove the files.
     remove_file_if_exists(Path::new(helper_proto::SUDOERS_FILE))?;
-    for right in [helper_proto::MOUNT_RIGHT, helper_proto::ADMIN_RIGHT] {
+    let rights = [helper_proto::MOUNT_RIGHT, helper_proto::ADMIN_RIGHT];
+    for right in rights.into_iter().chain(helper_proto::LEGACY_RIGHTS) {
         let _ = run_tool("/usr/bin/security", &["authorizationdb", "remove", right], None);
     }
     for path in &created {

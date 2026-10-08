@@ -21,7 +21,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleDevelopmentRegion</key><string>en</string>
     <key>CFBundleDisplayName</key><string>Remounty</string>
     <key>CFBundleExecutable</key><string>remounty</string>
-    <key>CFBundleIdentifier</key><string>io.github.remounty</string>
+    <key>CFBundleIdentifier</key><string>app.remounty</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>Remounty</string>
     <key>CFBundlePackageType</key><string>APPL</string>

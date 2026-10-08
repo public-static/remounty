@@ -4,7 +4,9 @@ use std::ffi::CStr;
 use std::path::PathBuf;
 
 pub const APP_NAME: &str = "Remounty";
-pub const BUNDLE_ID: &str = "io.github.remounty";
+pub const BUNDLE_ID: &str = "app.remounty";
+/// Identifier used by earlier builds (login item migration).
+pub const LEGACY_BUNDLE_ID: &str = "io.github.remounty";
 
 /// The current user's home directory.
 ///
@@ -68,4 +70,11 @@ pub fn user_name() -> Option<String> {
 
 pub fn launch_agent_path() -> Option<PathBuf> {
     home_dir().map(|h| h.join("Library/LaunchAgents").join(format!("{BUNDLE_ID}.plist")))
+}
+
+pub fn legacy_launch_agent_path() -> Option<PathBuf> {
+    home_dir().map(|h| {
+        h.join("Library/LaunchAgents")
+            .join(format!("{LEGACY_BUNDLE_ID}.plist"))
+    })
 }

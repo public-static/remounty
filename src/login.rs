@@ -26,6 +26,19 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
 /// Keeps an enabled agent pointing at the current executable (e.g. after the
 /// app was moved).
 pub fn refresh() {
+    // Earlier builds used another identifier; carry an enabled login item over.
+    if let Some(legacy) = paths::legacy_launch_agent_path()
+        && legacy.exists()
+    {
+        match set_enabled(true).and_then(|()| {
+            fs::remove_file(&legacy)
+                .map_err(|err| Error::new(format!("Removing {}: {err}", legacy.display())))
+        }) {
+            Ok(()) => crate::log_info!("Migrated the login item from {}", legacy.display()),
+            Err(err) => crate::log_warn!("Could not migrate the login item: {err}"),
+        }
+        return;
+    }
     if !is_enabled() {
         return;
     }
