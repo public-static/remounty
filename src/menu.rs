@@ -191,8 +191,11 @@ pub fn build(model: &MenuModel) -> Result<BuiltMenu> {
     }
     match &model.helper {
         Status::NeedsUpdate(reason) | Status::Broken(reason) if model.deps_ready => {
-            add(&label(&format!("⚠︎ Remounty's helper needs an update ({reason})")))?;
-            add(&item(&Action::InstallHelper, "Update Helper…", !model.busy))?;
+            add(&item(
+                &Action::InstallHelper,
+                &format!("⚠︎ Update Remounty's Helper… ({reason})"),
+                !model.busy,
+            ))?;
         }
         _ => {}
     }
@@ -333,7 +336,15 @@ fn helper_submenu(model: &MenuModel) -> Result<Submenu> {
             .append(i)
             .map_err(|err| Error::new(format!("Building menu: {err}")))
     };
-    add(&label(&format!("Status: {}", model.helper)))?;
+    // When something is wrong, the status line itself starts the update.
+    match &model.helper {
+        Status::NeedsUpdate(_) | Status::Broken(_) => add(&item(
+            &Action::InstallHelper,
+            &format!("⚠︎ Status: {} — Update…", model.helper),
+            !model.busy && model.deps_ready,
+        ))?,
+        other => add(&label(&format!("Status: {other}")))?,
+    }
     add(&PredefinedMenuItem::separator())?;
     add(&label("Remember Authorization"))?;
     let choices = [
