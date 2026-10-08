@@ -15,11 +15,18 @@ It works like Mounty and adds two things:
 Install ntfs-3g and macFUSE with [MacPorts](https://www.macports.org):
 
 ```sh
-sudo port install macfuse +fs_link ntfs-3g
+sudo port install macfuse +fs_link ntfs-3g +extra_progs
 ```
 
-`+fs_link` creates the `/Library/Filesystems/macfuse.fs` link that macOS
-needs. After installing macFUSE, allow its system extension in *System
+* `+fs_link` (macfuse) creates the `/Library/Filesystems/macfuse.fs` link that
+  macOS needs to find macFUSE.
+* `+extra_progs` (ntfs-3g) also installs the optional NTFS utilities that are
+  not built by default: `ntfsck` (consistency check), `ntfsdecrypt`,
+  `ntfsdump_logfile`, `ntfsfallocate`, `ntfsmftalloc`, `ntfsmove`,
+  `ntfstruncate` and `ntfswipe`. Remounty itself only uses `ntfs-3g`, so the
+  variant is optional; the extras are handy for inspecting or repairing a
+  volume by hand. Several of them modify the disk directly, so only use them
+  on unmounted volumes you have a backup of. After installing macFUSE, allow its system extension in *System
 Settings → Privacy & Security* and restart if asked.
 
 Remounty only runs ntfs-3g and macFUSE (as root) when **nobody but root can
