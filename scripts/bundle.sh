@@ -36,7 +36,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Nested code must be signed before the bundle itself.
-codesign --force --sign - "$APP/Contents/MacOS/remounty-helper" >/dev/null 2>&1 || echo "warning: signing the helper failed" >&2
-codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "warning: ad-hoc signing failed" >&2
+# Nested code must be signed before the bundle itself. "--options runtime"
+# enables the hardened runtime: no DYLD_* code injection, no debugger
+# attaching, only Apple- or identically-signed libraries.
+codesign --force --options runtime --sign - "$APP/Contents/MacOS/remounty-helper" >/dev/null 2>&1 \
+    || { echo "error: signing the helper failed" >&2; exit 1; }
+codesign --force --options runtime --sign - "$APP" >/dev/null 2>&1 \
+    || { echo "error: signing the app failed" >&2; exit 1; }
 echo "Built $APP"

@@ -58,10 +58,30 @@ pub fn status() -> Status {
         &["version"],
         Some(std::time::Duration::from_secs(10)),
     ) {
-        Ok(out) if out.success() && out.stdout.trim() == helper_proto::HELPER_VERSION => Status::Ready,
+        Ok(out) if out.success() && out.stdout.trim() == helper_proto::HELPER_VERSION => {
+            // Same protocol, but a rebuilt Remounty may carry a different
+            // (e.g. differently signed) helper; offer to install that one.
+            if matches_bundled_helper() {
+                Status::Ready
+            } else {
+                Status::NeedsUpdate("Remounty includes a newer build".into())
+            }
+        }
         Ok(out) if out.success() => Status::NeedsUpdate("Remounty was updated".into()),
         Ok(out) => Status::Broken(out.diagnostics()),
         Err(err) => Status::Broken(err.to_string()),
+    }
+}
+
+/// Whether the installed helper is byte-for-byte the one inside the app.
+/// Unknown (e.g. not running from the app bundle) counts as matching.
+fn matches_bundled_helper() -> bool {
+    let Ok(bundled) = bundled_helper() else {
+        return true;
+    };
+    match (std::fs::read(bundled), std::fs::read(helper_proto::HELPER_BIN)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => true,
     }
 }
 
